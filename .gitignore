@@ -1,0 +1,57 @@
+# Prerequisites & System
+*.tar.gz
+*.zip
+*.md5
+*.sha256
+.DS_Store
+.vscode/
+
+# Build and Binary
+*.o
+*.a
+*.so
+config.log
+config.status
+make.log
+autom4te.cache/
+
+# Data and Artifacts (SAR Processing)
+*.[sS][lL][cC]
+*.[gG][rR][dD]
+*.[pP][rR][mM]
+*.[lL][eE][dD]
+*.[dD][aA][tT]
+*.xml
+*.tiff
+*.tif
+*.RA
+*.LL
+*.ML
+*.unwrap
+*.phase
+*.amp
+*.corr
+trans.dat
+debug/
+logs/
+topo/
+raw/
+Dataset/
+
+# === Project Documentation Rules ===
+项目知识/
+*交接*
+*汇报*
+*Handover*
+*Chapter4*
+*专著*
+迭代.md
+CHANGELOG*
+AI_model*
+config.20*.txt
+*.md5
+*.sha256
+*.bak
+*.tmp
+temp/
+test_data/

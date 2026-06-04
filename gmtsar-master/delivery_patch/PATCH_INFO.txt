@@ -1,0 +1,38 @@
+===============================================
+电建一号 DInSAR 系统 - 补丁包
+PowerChina-1 (DJ1/BC3) GMTSAR Patch
+===============================================
+
+版本: v3.0-DJ1-20260117
+日期: 2026-01-17
+
+包含文件:
+---------
+1. p2p_processing.csh
+   - 添加 DJ1 卫星支持
+   - 添加 S1_STRIP 天仪定制参数 (-xsearch 256 -ysearch 128 -nx 30 -ny 50 -noshift)
+   - 集成 xcorr_fast (26× 加速)
+   - 修复 csh if() 语法
+
+2. gmtsar.h
+   - 全局变量 extern 声明 (防止链接错误)
+
+3. config.mk
+   - 添加 -fcommon 编译标志 (GCC 10+ 兼容)
+
+4. sarglobal.h (NEW)
+   - verbose/debug 变量改为 extern 声明
+
+5. make_s1a_tops_6par.c (NEW)
+   - sv 数组扩展 400→1000 (防止长时间跨度数据溢出)
+
+部署方法:
+---------
+cp delivery_patch/p2p_processing.csh $GMTSAR_HOME/gmtsar/csh/
+cp delivery_patch/gmtsar.h $GMTSAR_HOME/gmtsar/
+cp delivery_patch/config.mk $GMTSAR_HOME/
+cd $GMTSAR_HOME && make clean && make && make install
+
+验证测试:
+---------
+p2p_processing.csh S1_STRIP <Master> <Slave> config.s1a.txt
