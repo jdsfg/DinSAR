@@ -390,7 +390,10 @@ generate_trans_dat() {
     
     local dem_grd="$PROJECT_DIR/topo/dem.grd"
     if [ ! -f "$dem_grd" ] && [ -n "$DEM_PATH" ] && [ -f "$DEM_PATH" ]; then
-        gmt grdconvert "$DEM_PATH" "$dem_grd" >> "$LOG_FILE" 2>&1
+        log_info "将 DEM 重投影到 EPSG:4326 (WGS84)..."
+        gdalwarp -t_srs EPSG:4326 -r bilinear -of netCDF "$DEM_PATH" "${dem_grd}.tmp" >> "$LOG_FILE" 2>&1
+        gmt grdconvert "${dem_grd}.tmp" "$dem_grd" >> "$LOG_FILE" 2>&1 || cp "${dem_grd}.tmp" "$dem_grd"
+        rm -f "${dem_grd}.tmp"
     fi
 
     if [ -f "$dem_grd" ] && command -v SAT_llt2rat &>/dev/null && [ -f "${MASTER_DATE}.PRM" ]; then
@@ -423,6 +426,14 @@ generate_slc() {
     if ! make_slc_dj1 "$SLAVE_XML" "$SLAVE_TIFF" "$SLAVE_DATE" >> "$LOG_FILE" 2>&1; then
         log_warn "make_slc_dj1 失败，尝试 make_slc_s1a..."
         make_slc_s1a "$SLAVE_XML" "$SLAVE_TIFF" "$SLAVE_DATE" >> "$LOG_FILE" 2>&1 || error_exit "辅影像 SLC 生成失败"
+    fi
+    
+    # 核心修复: 自动修复 PRM 文件参数 (earth_radius, SC_vel, SC_height, tie_point)
+    if [ -f "$PROJECT_DIR/SLC/fix_prm.py" ]; then
+        log_info "修复主影像 PRM 文件参数..."
+        python3 "$PROJECT_DIR/SLC/fix_prm.py" "${MASTER_DATE}.PRM" "$MASTER_XML" "${MASTER_DATE}.LED" >> "$LOG_FILE" 2>&1
+        log_info "修复辅影像 PRM 文件参数..."
+        python3 "$PROJECT_DIR/SLC/fix_prm.py" "${SLAVE_DATE}.PRM" "$SLAVE_XML" "${SLAVE_DATE}.LED" >> "$LOG_FILE" 2>&1
     fi
     
     log_info "SLC 生成完成"
@@ -494,6 +505,14 @@ run_alignment() {
 run_interferogram() {
     log_step "[3/8] 生成干涉图..."
     
+    # Checkpoint
+    local intf_dir="$PROJECT_DIR/intf/${MASTER_DATE}_${SLAVE_DATE}"
+    if [ -f "$intf_dir/phase.grd" ] && [ -f "$intf_dir/amp.grd" ]; then
+        log_info "已存在 phase.grd, 跳过干涉图生成 (Checkpoint)"
+        INTF_DIR="$intf_dir"
+        return 0
+    fi
+    
     # 创建干涉目录
     local intf_dir="$PROJECT_DIR/intf/${MASTER_DATE}_${SLAVE_DATE}"
     mkdir -p "$intf_dir"
@@ -513,8 +532,28 @@ run_interferogram() {
         SAT_baseline "${MASTER_DATE}.PRM" "${MASTER_DATE}.PRM" | grep height >> "${MASTER_DATE}.PRM" 2>/dev/null || true
     fi
     
+    # 核心修复: 生成并去除地形相位
+    local dem_grd="$PROJECT_DIR/topo/dem.grd"
+    local topo_arg=""
+    if [ -f "$dem_grd" ]; then
+        if [ ! -f dem_ra.grd ]; then
+            log_info "生成雷达坐标 DEM (dem_ra.grd) 以去除地形相位..."
+            bash /home/mihu/gmtsar/DInSAR_v2.3_Delivery/fast_dem2topo_ra.sh "${MASTER_DATE}.PRM" "$dem_grd" "$LOG_FILE"
+        fi
+        if [ -f dem_ra.grd ]; then
+            # 核心修复: 替换 dem_ra.grd 中的 NaN 值为 0，防止 phasediff.c 的 calc_average_topo 算得 NaN 导致全图变 NaN/0
+            log_info "清洗雷达坐标 DEM (dem_ra.grd) 以免除 NaN 引起的计算链崩溃..."
+            gmt grdmath dem_ra.grd 0 AND = dem_ra_clean.grd >> "$LOG_FILE" 2>&1
+            mv dem_ra_clean.grd dem_ra.grd
+            topo_arg="-topo dem_ra.grd"
+            log_info "将去除地形相位 (Differential InSAR 模式)"
+        fi
+    else
+        log_warn "未找到 $dem_grd，只能生成含地形相位的原始干涉图"
+    fi
+    
     log_info "运行 phasediff..."
-    phasediff "${MASTER_DATE}.PRM" "${SLAVE_DATE}.PRM" -imag imag.grd -real real.grd >> "$LOG_FILE" 2>&1
+    phasediff "${MASTER_DATE}.PRM" "${SLAVE_DATE}.PRM" -imag imag.grd -real real.grd $topo_arg >> "$LOG_FILE" 2>&1
     
     if [ ! -f real.grd ] || [ ! -f imag.grd ]; then
         error_exit "phasediff 失败"
@@ -525,10 +564,7 @@ run_interferogram() {
     gmt grdmath real.grd imag.grd ATAN2 = phase.grd
     gmt grdmath real.grd imag.grd HYPOT = amp.grd
     
-    # 计算相干性
-    log_info "计算相干性..."
-    gmt grdmath amp.grd 0.001 ADD LOG10 = corr.grd 2>/dev/null || touch corr.grd
-    
+    # 真实的相干性应当由滤波步骤 (phasefilt) 计算
     log_info "干涉图生成完成"
     
     # 保存干涉目录路径
@@ -540,18 +576,28 @@ run_filter() {
     
     cd "$INTF_DIR" || error_exit "无法进入干涉目录"
     
+    if [ -f "phasefilt.grd" ]; then
+        log_info "已存在 phasefilt.grd, 跳过滤波 (Checkpoint)"
+        FILT_PHASE="phasefilt.grd"
+        return 0
+    fi
+    
     # 降采样 (如果需要)
     if [ "$DOWNSAMPLE_FACTOR" -gt 1 ]; then
-        log_info "降采样 ${DOWNSAMPLE_FACTOR}x..."
+        log_info "抗混叠降采样 ${DOWNSAMPLE_FACTOR}x (Gaussian Filter)..."
         local xinc yinc xinc_dec yinc_dec
         xinc=$(gmt grdinfo phase.grd -C 2>/dev/null | awk '{print $8}')
         yinc=$(gmt grdinfo phase.grd -C 2>/dev/null | awk '{print $9}')
         xinc_dec=$(awk -v inc="$xinc" -v f="$DOWNSAMPLE_FACTOR" 'BEGIN{printf "%.12g", inc*f}')
         yinc_dec=$(awk -v inc="$yinc" -v f="$DOWNSAMPLE_FACTOR" 'BEGIN{printf "%.12g", inc*f}')
-        gmt grdsample phase.grd -I${xinc_dec}/${yinc_dec} -Gphase_dec.grd >> "$LOG_FILE" 2>&1
-        gmt grdsample amp.grd -I${xinc_dec}/${yinc_dec} -Gamp_dec.grd >> "$LOG_FILE" 2>&1
-        gmt grdsample real.grd -I${xinc_dec}/${yinc_dec} -Greal_dec.grd >> "$LOG_FILE" 2>&1
-        gmt grdsample imag.grd -I${xinc_dec}/${yinc_dec} -Gimag_dec.grd >> "$LOG_FILE" 2>&1
+        
+        local fw=$((DOWNSAMPLE_FACTOR))
+        # 核心优化1：使用高斯滤波进行纯复数域空间降采样，消除频域混叠
+        gmt grdfilter real.grd -Fg${fw}/${fw} -D0 -I${xinc_dec}/${yinc_dec} -Greal_dec.grd >> "$LOG_FILE" 2>&1
+        gmt grdfilter imag.grd -Fg${fw}/${fw} -D0 -I${xinc_dec}/${yinc_dec} -Gimag_dec.grd >> "$LOG_FILE" 2>&1
+        
+        gmt grdmath real_dec.grd imag_dec.grd ATAN2 = phase_dec.grd
+        gmt grdmath real_dec.grd imag_dec.grd HYPOT = amp_dec.grd
         
         PHASE_FILE="phase_dec.grd"
         REAL_FILE="real_dec.grd"
@@ -564,14 +610,15 @@ run_filter() {
         AMP_FILE="amp.grd"
     fi
     
-    # Goldstein 滤波
-    log_info "Goldstein 滤波..."
+    # 核心优化2：增强型 Goldstein 滤波 (Alpha 强自适应)
+    log_info "强力自适应 Goldstein 滤波 (Alpha=0.8)..."
     if command -v phasefilt &>/dev/null; then
-        if [ ! -s "$REAL_FILE" ] || [ ! -s "$IMAG_FILE" ] || [ ! -s "$AMP_FILE" ]; then
-            error_exit "phasefilt 输入文件缺失或为空 (real/imag/amp)"
+        if [ ! -s "$REAL_FILE" ] || [ ! -s "$IMAG_FILE" ]; then
+            error_exit "phasefilt 输入文件缺失或为空 (real/imag)"
         fi
 
-        local phasefilt_cmd="phasefilt -imag $IMAG_FILE -real $REAL_FILE -amp1 $AMP_FILE -amp2 $AMP_FILE -psize 32"
+        # 剥离无意义的 amp 输入，强制使用固定高强度的 alpha 以适应高山峡谷 (X-band)
+        local phasefilt_cmd="phasefilt -imag $IMAG_FILE -real $REAL_FILE -alpha 0.8 -psize 32"
         log_info "执行: $phasefilt_cmd"
         eval "$phasefilt_cmd" >> "$LOG_FILE" 2>&1
         local phasefilt_rc=$?
@@ -587,6 +634,18 @@ run_filter() {
         else
             error_exit "phasefilt 未生成有效输出 (filtphase.grd/phasefilt.grd)"
         fi
+        
+        # 核心优化3：重构真实物理相干性评估 (Pearson Correlation)
+        log_info "计算基于空间包络滤波的真实干涉相干性 (Pearson Correlation)..."
+        # 1. 对复数干涉图的实部和虚部进行空间平滑，计算分子强度
+        gmt grdfilter "$REAL_FILE" -Fg20/20 -D0 -Greal_mean.grd >> "$LOG_FILE" 2>&1
+        gmt grdfilter "$IMAG_FILE" -Fg20/20 -D0 -Gimag_mean.grd >> "$LOG_FILE" 2>&1
+        gmt grdmath real_mean.grd imag_mean.grd HYPOT = num_amp.grd
+        # 2. 对复数干涉图的绝对振幅进行空间平滑，计算分母
+        gmt grdmath "$REAL_FILE" "$IMAG_FILE" HYPOT = raw_amp.grd
+        gmt grdfilter raw_amp.grd -Fg20/20 -D0 -Gden_amp.grd >> "$LOG_FILE" 2>&1
+        # 3. 计算相干系数 (防止除零，并将上限截断到 1.0，安全替换 NaN 为 0)
+        gmt grdmath num_amp.grd den_amp.grd DIV 1.0 MIN 0 AND = corr.grd
     else
         FILT_PHASE="$PHASE_FILE"
         log_warn "phasefilt 不可用，跳过滤波"
@@ -614,24 +673,25 @@ run_unwrap() {
     
     # 相干性掩膜（低相干区域置零，降低解缠负担）
     local phase_for_unwrap="$FILT_PHASE"
-    local corr_source=""
-    if [ -f filtcorr.grd ]; then
-        corr_source="filtcorr.grd"
-    elif [ -f corr.grd ]; then
-        corr_source="corr.grd"
-    fi
-    if [ -n "$corr_source" ]; then
-        log_info "生成相干性掩膜 (阈值=0.15): $corr_source"
-        gmt grdmath "$corr_source" 0.15 GE = coh_mask.grd >> "$LOG_FILE" 2>&1
-        gmt grdmath "$FILT_PHASE" coh_mask.grd MUL = phase_masked.grd >> "$LOG_FILE" 2>&1
+    local corr_source="corr.grd"
+    
+    if [ -f "$corr_source" ]; then
+        log_info "生成相干性硬掩膜 (阈值=0.20): $corr_source"
+        gmt grdmath "$corr_source" 0.20 GE = coh_mask.grd >> "$LOG_FILE" 2>&1
+        gmt grdmath "$FILT_PHASE" coh_mask.grd MUL 0 AND = phase_masked.grd >> "$LOG_FILE" 2>&1
         if [ -f phase_masked.grd ]; then
             phase_for_unwrap="phase_masked.grd"
         fi
     fi
 
-    # 转换为二进制格式
-    log_info "准备 snaphu 输入..."
-    gmt grd2xyz "$phase_for_unwrap" -ZTLf > phase.bin 2>> "$LOG_FILE"
+    # 转换为二进制格式并安全替换 NaN 值为 0 (防止 snaphu 崩溃)
+    log_info "准备 snaphu 相位与相干性双输入阵列..."
+    gmt grdmath "$phase_for_unwrap" 0 AND = phase_no_nan.grd >> "$LOG_FILE" 2>&1
+    gmt grd2xyz phase_no_nan.grd -ZTLf > phase.bin 2>> "$LOG_FILE"
+    if [ -f "$corr_source" ]; then
+        gmt grdmath "$corr_source" 0 AND = corr_no_nan.grd >> "$LOG_FILE" 2>&1
+        gmt grd2xyz corr_no_nan.grd -ZTLf > corr.bin 2>> "$LOG_FILE"
+    fi
     
     # 构建 snaphu 命令
     local snaphu_cmd="snaphu phase.bin $ncols -o unwrap.bin"
@@ -663,6 +723,12 @@ run_unwrap() {
     fi
     
     snaphu_cmd="$snaphu_cmd -d"
+    
+    # 核心优化4：将相干性输入 SNAPHU 以构建高精度成本流网络 (Cost Graph)
+    if [ -f corr.bin ]; then
+        snaphu_cmd="$snaphu_cmd -c corr.bin"
+        log_info "启用基于相关性的统计成本函数模型 (-c corr.bin)"
+    fi
     
     log_info "运行 snaphu..."
     log_info "命令: $snaphu_cmd"
@@ -744,15 +810,10 @@ run_atm_correction() {
             return 0
         fi
         
-        # 生成雷达坐标 DEM (dem_ra.grd)
+        # 生成雷达坐标 DEM (dem_ra.grd) - 使用快速算法
         if [ ! -f dem_ra.grd ]; then
-            log_info "正在生成雷达坐标 DEM (dem_ra.grd)..."
-            if command -v dem2topo_ra.csh &>/dev/null; then
-                dem2topo_ra.csh "${MASTER_DATE}.PRM" "$dem_grd" >> "$LOG_FILE" 2>&1
-                if [ -f topo_ra.grd ]; then
-                    mv topo_ra.grd dem_ra.grd
-                fi
-            fi
+            log_info "正在生成雷达坐标 DEM (dem_ra.grd) [快速算法]..."
+            bash /home/mihu/gmtsar/DInSAR_v2.3_Delivery/fast_dem2topo_ra.sh "${MASTER_DATE}.PRM" "$dem_grd" "$LOG_FILE"
         fi
         
         if [ ! -f dem_ra.grd ]; then
@@ -838,6 +899,11 @@ run_detrend() {
     
     cd "$INTF_DIR" || error_exit "无法进入干涉目录"
     
+    if [ -f "unwrap_detrended.grd" ]; then
+        log_info "已存在 unwrap_detrended.grd, 跳过去倾斜 (Checkpoint)"
+        return 0
+    fi
+    
     if [ ! -f unwrap.grd ]; then
         log_warn "未找到解缠结果，跳过去倾斜"
         return 0
@@ -916,21 +982,33 @@ generate_outputs() {
     
     cd "$INTF_DIR" || error_exit "无法进入干涉目录"
     
+    # 核心修复: 确保 FILT_PHASE 变量在跳过 Checkpoint 时依旧被正确注入
+    if [ -z "$FILT_PHASE" ]; then
+        if [ -f "phasefilt.grd" ]; then
+            FILT_PHASE="phasefilt.grd"
+        elif [ -f "phase_dec.grd" ]; then
+            FILT_PHASE="phase_dec.grd"
+        else
+            FILT_PHASE="phase.grd"
+        fi
+    fi
+    
     local results_dir="$PROJECT_DIR/results"
     mkdir -p "$results_dir"
     
     # 若缺少 dem.grd，尝试从 DEM_PATH 或 topo/*.tif 自动生成
     if [ ! -f "$PROJECT_DIR/topo/dem.grd" ]; then
+        local src_dem=""
         if [ -n "$DEM_PATH" ] && [ -f "$DEM_PATH" ]; then
-            log_info "检测到 DEM_PATH，生成 topo/dem.grd..."
-            gmt grdconvert "$DEM_PATH" "$PROJECT_DIR/topo/dem.grd" >> "$LOG_FILE" 2>&1 || true
+            src_dem="$DEM_PATH"
         else
-            local tif_dem
-            tif_dem=$(ls "$PROJECT_DIR"/topo/*.{tif,TIF,tiff,TIFF} 2>/dev/null | head -n 1)
-            if [ -n "$tif_dem" ]; then
-                log_info "检测到 topo 下 DEM: $tif_dem，生成 topo/dem.grd..."
-                gmt grdconvert "$tif_dem" "$PROJECT_DIR/topo/dem.grd" >> "$LOG_FILE" 2>&1 || true
-            fi
+            src_dem=$(ls "$PROJECT_DIR"/topo/*.{tif,TIF,tiff,TIFF} 2>/dev/null | head -n 1)
+        fi
+        if [ -n "$src_dem" ]; then
+            log_info "检测到 DEM: $src_dem，强制重投影为 EPSG:4326 以保证地理编码不越界..."
+            gdalwarp -t_srs EPSG:4326 -r bilinear -of netCDF "$src_dem" "${PROJECT_DIR}/topo/dem_tmp.nc" >> "$LOG_FILE" 2>&1
+            gmt grdconvert "${PROJECT_DIR}/topo/dem_tmp.nc" "$PROJECT_DIR/topo/dem.grd" >> "$LOG_FILE" 2>&1 || cp "${PROJECT_DIR}/topo/dem_tmp.nc" "$PROJECT_DIR/topo/dem.grd"
+            rm -f "${PROJECT_DIR}/topo/dem_tmp.nc"
         fi
     fi
 
@@ -955,15 +1033,18 @@ generate_outputs() {
         if [ ! -x "$proj_csh" ]; then
             proj_csh="proj_ra2ll.csh"
         fi
-        # 雷达坐标 -> 经纬度 (filter_wavelength=8 用于 DJ1/BC3)
+        # 雷达坐标 -> 经纬度 GeoTIFF (使用高可用性 Python 算法)
+        local py_geocode="/home/mihu/gmtsar/DInSAR_v2.3_Delivery/geocode_gdal.py"
         if [ -f unwrap_detrended.grd ]; then
-            csh -f "$proj_csh" trans.dat unwrap_detrended.grd unwrap_detrended_ll.grd 8 >> "$LOG_FILE" 2>&1 || true
+            python3 "$py_geocode" trans.dat unwrap_detrended.grd "$results_dir/unwrap_detrended.tif" 0.0001 >> "$LOG_FILE" 2>&1 || true
         fi
-        if [ -f corr.grd ]; then
-            csh -f "$proj_csh" trans.dat corr.grd corr_ll.grd 8 >> "$LOG_FILE" 2>&1 || true
+        local corr_src=""
+        [ -f filtcorr.grd ] && corr_src="filtcorr.grd" || corr_src="corr.grd"
+        if [ -n "$corr_src" ] && [ -f "$corr_src" ]; then
+            python3 "$py_geocode" trans.dat "$corr_src" "$results_dir/corr.tif" 0.0001 >> "$LOG_FILE" 2>&1 || true
         fi
         if [ -f los_displacement.grd ]; then
-            csh -f "$proj_csh" trans.dat los_displacement.grd los_displacement_ll.grd 8 >> "$LOG_FILE" 2>&1 || true
+            python3 "$py_geocode" trans.dat los_displacement.grd "$results_dir/final_data_values.tif" 0.0001 >> "$LOG_FILE" 2>&1 || true
         fi
         
         # ----- 输出 A：前端图层 (Visual) - RGBA GeoTIFF，背景透明 -----
@@ -1010,15 +1091,15 @@ generate_outputs() {
     if [ -f "$FILT_PHASE" ]; then
         local pmin=$(gmt grdinfo "$FILT_PHASE" -C 2>/dev/null | awk '{print $6}')
         local pmax=$(gmt grdinfo "$FILT_PHASE" -C 2>/dev/null | awk '{print $7}')
-        if [ -n "$pmin" ] && [ -n "$pmax" ] && [ "$pmin" != "NaN" ] && [ "$pmax" != "NaN" ]; then
-            gmt begin "$results_dir/interferogram" png E300 >> "$LOG_FILE" 2>&1
+        if [ -n "$pmin" ] && [ -n "$pmax" ] && [ "$pmin" != "NaN" ] && [ "$pmax" != "NaN" ] && [ "$pmin" != "$pmax" ]; then
+            gmt begin "$results_dir/interferogram" png E100 >> "$LOG_FILE" 2>&1
             gmt makecpt -Ccyclic -T"$pmin"/"$pmax" > phase.cpt 2>> "$LOG_FILE"
             gmt grdimage "$FILT_PHASE" -JX15c -Cphase.cpt -Baf >> "$LOG_FILE" 2>&1
             gmt colorbar -Cphase.cpt -DJBC+w12c/0.4c -Baf+l"Phase (rad)" >> "$LOG_FILE" 2>&1
             gmt end >> "$LOG_FILE" 2>&1
             log_info "干涉条纹图: results/interferogram.png"
         else
-            log_warn "相位数据无效（全 NaN），跳过干涉条纹图生成"
+            log_warn "相位数据范围不足或全为零，跳过干涉条纹图生成"
         fi
     fi
     
@@ -1026,15 +1107,15 @@ generate_outputs() {
     if [ -f los_displacement.grd ]; then
         local dmin2=$(gmt grdinfo los_displacement.grd -C 2>/dev/null | awk '{printf "%.1f", $6}')
         local dmax2=$(gmt grdinfo los_displacement.grd -C 2>/dev/null | awk '{printf "%.1f", $7}')
-        if [ -n "$dmin2" ] && [ -n "$dmax2" ] && [ "$dmin2" != "NaN" ] && [ "$dmax2" != "NaN" ]; then
-            gmt begin "$results_dir/displacement" png E300 >> "$LOG_FILE" 2>&1
+        if [ -n "$dmin2" ] && [ -n "$dmax2" ] && [ "$dmin2" != "NaN" ] && [ "$dmax2" != "NaN" ] && [ "$dmin2" != "$dmax2" ]; then
+            gmt begin "$results_dir/displacement" png E100 >> "$LOG_FILE" 2>&1
             gmt makecpt -Cpolar -T"$dmin2"/"$dmax2" > disp.cpt 2>> "$LOG_FILE"
             gmt grdimage los_displacement.grd -JX15c -Cdisp.cpt -Baf >> "$LOG_FILE" 2>&1
             gmt colorbar -Cdisp.cpt -DJBC+w12c/0.4c -Baf+l"LOS Displacement (mm)" >> "$LOG_FILE" 2>&1
             gmt end >> "$LOG_FILE" 2>&1
             log_info "位移图: results/displacement.png"
         else
-            log_warn "位移数据无效（全 NaN），跳过位移图生成"
+            log_warn "位移数据范围不足或全为零，跳过位移图生成"
         fi
         # 雷达坐标 GeoTIFF（无地理编码时保留）
         if [ "$have_trans" -eq 0 ]; then
