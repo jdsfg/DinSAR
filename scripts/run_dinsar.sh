@@ -13,7 +13,7 @@
 # 日期: 2026-01-28
 #=============================================================================
 
-set -o pipefail
+set -euo pipefail
 
 #-----------------------------------------------------------------------------
 # 全局变量
@@ -57,6 +57,11 @@ DETREND_ORDER=6
 # 运行时变量
 LOG_FILE=""
 START_TIME=""
+INTF_DIR=""
+FILT_PHASE=""
+MASTER_TIFF=""
+SLAVE_TIFF=""
+DEM_PATH="${DEM_PATH:-}"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -482,10 +487,9 @@ run_alignment() {
     esac
 
     log_info "运行 xcorr（${PROCESS_MODE}）..."
-    xcorr "$master_prm" "$slave_prm" -xsearch "$xsearch" -ysearch "$ysearch" -nx "$nx_corr" -ny "$ny_corr" >> "$LOG_FILE" 2>&1
-    
-    if [ $? -ne 0 ]; then
-        log_warn "xcorr 返回非零，检查日志..."
+    if ! xcorr "$master_prm" "$slave_prm" -xsearch "$xsearch" -ysearch "$ysearch" -nx "$nx_corr" -ny "$ny_corr" >> "$LOG_FILE" 2>&1; then
+        log_error "xcorr 失败 (退出码: $?)，请检查日志: $LOG_FILE"
+        return 1
     fi
 
     # 若存在 fitoffset.csh 且生成了 freq_xcorr.dat，则用 threshold_snr 拟合并写回 PRM
@@ -528,8 +532,12 @@ run_interferogram() {
 
     # 兼容 GMTSAR 标准流程：在 phasediff 前补齐基线参数
     if command -v SAT_baseline &>/dev/null; then
-        SAT_baseline "${MASTER_DATE}.PRM" "${SLAVE_DATE}.PRM" | tail -n 9 >> "${SLAVE_DATE}.PRM" 2>/dev/null || true
-        SAT_baseline "${MASTER_DATE}.PRM" "${MASTER_DATE}.PRM" | grep height >> "${MASTER_DATE}.PRM" 2>/dev/null || true
+        if ! SAT_baseline "${MASTER_DATE}.PRM" "${SLAVE_DATE}.PRM" 2>>"$LOG_FILE" | tail -n 9 >> "${SLAVE_DATE}.PRM"; then
+            log_warn "SAT_baseline (slave) 返回非零，基线参数可能不完整"
+        fi
+        if ! SAT_baseline "${MASTER_DATE}.PRM" "${MASTER_DATE}.PRM" 2>>"$LOG_FILE" | grep height >> "${MASTER_DATE}.PRM"; then
+            log_warn "SAT_baseline (master) 未提取到 height 参数"
+        fi
     fi
     
     # 核心修复: 生成并去除地形相位
@@ -553,18 +561,25 @@ run_interferogram() {
     fi
     
     log_info "运行 phasediff..."
-    phasediff "${MASTER_DATE}.PRM" "${SLAVE_DATE}.PRM" -imag imag.grd -real real.grd $topo_arg >> "$LOG_FILE" 2>&1
+    if ! phasediff "${MASTER_DATE}.PRM" "${SLAVE_DATE}.PRM" -imag imag.grd -real real.grd $topo_arg >> "$LOG_FILE" 2>&1; then
+        log_error "phasediff 返回非零退出码"
+    fi
     
     if [ ! -f real.grd ] || [ ! -f imag.grd ]; then
-        error_exit "phasediff 失败"
+        error_exit "phasediff 失败: 未生成 real.grd/imag.grd"
     fi
     
     # 计算相位和振幅
     log_info "计算相位和振幅..."
-    gmt grdmath real.grd imag.grd ATAN2 = phase.grd
-    gmt grdmath real.grd imag.grd HYPOT = amp.grd
+    if ! gmt grdmath real.grd imag.grd ATAN2 = phase.grd 2>>"$LOG_FILE"; then
+        error_exit "相位计算失败 (ATAN2)"
+    fi
+    if ! gmt grdmath real.grd imag.grd HYPOT = amp.grd 2>>"$LOG_FILE"; then
+        error_exit "振幅计算失败 (HYPOT)"
+    fi
     
     # 真实的相干性应当由滤波步骤 (phasefilt) 计算
+
     log_info "干涉图生成完成"
     
     # 保存干涉目录路径
@@ -586,8 +601,11 @@ run_filter() {
     if [ "$DOWNSAMPLE_FACTOR" -gt 1 ]; then
         log_info "抗混叠降采样 ${DOWNSAMPLE_FACTOR}x (Gaussian Filter)..."
         local xinc yinc xinc_dec yinc_dec
-        xinc=$(gmt grdinfo phase.grd -C 2>/dev/null | awk '{print $8}')
-        yinc=$(gmt grdinfo phase.grd -C 2>/dev/null | awk '{print $9}')
+        xinc=$(gmt grdinfo phase.grd -C 2>>"$LOG_FILE" | awk '{print $8}')
+        yinc=$(gmt grdinfo phase.grd -C 2>>"$LOG_FILE" | awk '{print $9}')
+        if [ -z "$xinc" ] || [ -z "$yinc" ]; then
+            error_exit "无法从 phase.grd 读取网格间距 (gmt grdinfo 失败)"
+        fi
         xinc_dec=$(awk -v inc="$xinc" -v f="$DOWNSAMPLE_FACTOR" 'BEGIN{printf "%.12g", inc*f}')
         yinc_dec=$(awk -v inc="$yinc" -v f="$DOWNSAMPLE_FACTOR" 'BEGIN{printf "%.12g", inc*f}')
         
@@ -666,8 +684,13 @@ run_unwrap() {
     fi
     
     # 获取影像尺寸
-    local ncols=$(gmt grdinfo "$FILT_PHASE" -C | awk '{print $10}')
-    local nrows=$(gmt grdinfo "$FILT_PHASE" -C | awk '{print $11}')
+    local ncols nrows
+    ncols=$(gmt grdinfo "$FILT_PHASE" -C 2>>"$LOG_FILE" | awk '{print $10}')
+    nrows=$(gmt grdinfo "$FILT_PHASE" -C 2>>"$LOG_FILE" | awk '{print $11}')
+    
+    if [ -z "$ncols" ] || [ -z "$nrows" ] || [ "$ncols" -eq 0 ] || [ "$nrows" -eq 0 ]; then
+        error_exit "无法获取滤波相位影像尺寸 (gmt grdinfo $FILT_PHASE 失败)"
+    fi
     
     log_info "影像尺寸: ${ncols} x ${nrows}"
     
@@ -737,9 +760,7 @@ run_unwrap() {
     local unwrap_start=$(date +%s)
     
     # 运行 snaphu
-    eval "$snaphu_cmd" >> "$LOG_FILE" 2>&1
-    
-    if [ $? -ne 0 ]; then
+    if ! eval "$snaphu_cmd" >> "$LOG_FILE" 2>&1; then
         log_error "snaphu 失败，查看日志: $LOG_FILE"
         return 1
     fi
@@ -762,15 +783,19 @@ run_unwrap() {
 
     # 转换回 GRD 格式
     log_info "转换解缠结果..."
-    local xmin=$(gmt grdinfo "$FILT_PHASE" -C | awk '{print $2}')
-    local xmax=$(gmt grdinfo "$FILT_PHASE" -C | awk '{print $3}')
-    local ymin=$(gmt grdinfo "$FILT_PHASE" -C | awk '{print $4}')
-    local ymax=$(gmt grdinfo "$FILT_PHASE" -C | awk '{print $5}')
-    local xinc=$(gmt grdinfo "$FILT_PHASE" -C | awk '{print $8}')
-    local yinc=$(gmt grdinfo "$FILT_PHASE" -C | awk '{print $9}')
+    local xmin xmax ymin ymax xinc yinc
+    xmin=$(gmt grdinfo "$FILT_PHASE" -C 2>>"$LOG_FILE" | awk '{print $2}')
+    xmax=$(gmt grdinfo "$FILT_PHASE" -C 2>>"$LOG_FILE" | awk '{print $3}')
+    ymin=$(gmt grdinfo "$FILT_PHASE" -C 2>>"$LOG_FILE" | awk '{print $4}')
+    ymax=$(gmt grdinfo "$FILT_PHASE" -C 2>>"$LOG_FILE" | awk '{print $5}')
+    xinc=$(gmt grdinfo "$FILT_PHASE" -C 2>>"$LOG_FILE" | awk '{print $8}')
+    yinc=$(gmt grdinfo "$FILT_PHASE" -C 2>>"$LOG_FILE" | awk '{print $9}')
     
-    gmt xyz2grd unwrap.bin -Gunwrap.grd -I$xinc/$yinc -R$xmin/$xmax/$ymin/$ymax -r -ZTLf >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
+    if [ -z "$xmin" ] || [ -z "$xmax" ] || [ -z "$ymin" ] || [ -z "$ymax" ] || [ -z "$xinc" ] || [ -z "$yinc" ]; then
+        error_exit "无法从 $FILT_PHASE 获取网格范围 (gmt grdinfo 失败)"
+    fi
+    
+    if ! gmt xyz2grd unwrap.bin -Gunwrap.grd -I"$xinc"/"$yinc" -R"$xmin"/"$xmax"/"$ymin"/"$ymax" -r -ZTLf >> "$LOG_FILE" 2>&1; then
         error_exit "gmt xyz2grd 失败，无法生成 unwrap.grd"
     fi
     
@@ -912,12 +937,10 @@ run_detrend() {
     # 关键: 在相位域进行去倾斜 (物理正确)
     log_info "拟合轨道残余趋势面 (N=$DETREND_ORDER)..."
     
-    gmt grdtrend unwrap.grd -N${DETREND_ORDER}r \
+    if ! gmt grdtrend unwrap.grd -N${DETREND_ORDER}r \
         -T"$PROJECT_DIR/debug/orbital_ramp.grd" \
         -Dunwrap_detrended.grd \
-        -V >> "$LOG_FILE" 2>&1
-    
-    if [ $? -ne 0 ] || [ ! -f unwrap_detrended.grd ]; then
+        -V >> "$LOG_FILE" 2>&1 || [ ! -f unwrap_detrended.grd ]; then
         log_warn "grdtrend 失败，使用原始解缠结果"
         cp unwrap.grd unwrap_detrended.grd
     fi
@@ -945,10 +968,12 @@ run_displacement() {
     # 公式: d = φ × λ / (-4π) × 1000
     log_info "转换相位为 LOS 位移..."
     
-    gmt grdmath "$input_phase" $WAVELENGTH MUL -4 PI MUL DIV 1000 MUL = los_displacement.grd
+    if ! gmt grdmath "$input_phase" $WAVELENGTH MUL -4 PI MUL DIV 1000 MUL = los_displacement.grd 2>>"$LOG_FILE"; then
+        error_exit "gmt grdmath 位移计算失败"
+    fi
     
     if [ ! -f los_displacement.grd ]; then
-        error_exit "位移计算失败"
+        error_exit "位移计算失败: los_displacement.grd 未生成"
     fi
     
     # 统计位移范围
@@ -1006,8 +1031,12 @@ generate_outputs() {
         fi
         if [ -n "$src_dem" ]; then
             log_info "检测到 DEM: $src_dem，强制重投影为 EPSG:4326 以保证地理编码不越界..."
-            gdalwarp -t_srs EPSG:4326 -r bilinear -of netCDF "$src_dem" "${PROJECT_DIR}/topo/dem_tmp.nc" >> "$LOG_FILE" 2>&1
-            gmt grdconvert "${PROJECT_DIR}/topo/dem_tmp.nc" "$PROJECT_DIR/topo/dem.grd" >> "$LOG_FILE" 2>&1 || cp "${PROJECT_DIR}/topo/dem_tmp.nc" "$PROJECT_DIR/topo/dem.grd"
+            if ! gdalwarp -t_srs EPSG:4326 -r bilinear -of netCDF "$src_dem" "${PROJECT_DIR}/topo/dem_tmp.nc" >> "$LOG_FILE" 2>&1; then
+                log_warn "DEM 重投影失败 ($src_dem)，地理编码将不可用"
+            elif ! gmt grdconvert "${PROJECT_DIR}/topo/dem_tmp.nc" "$PROJECT_DIR/topo/dem.grd" >> "$LOG_FILE" 2>&1; then
+                log_warn "DEM grdconvert 失败，尝试直接使用 netCDF..."
+                cp "${PROJECT_DIR}/topo/dem_tmp.nc" "$PROJECT_DIR/topo/dem.grd"
+            fi
             rm -f "${PROJECT_DIR}/topo/dem_tmp.nc"
         fi
     fi
@@ -1035,16 +1064,29 @@ generate_outputs() {
         fi
         # 雷达坐标 -> 经纬度 GeoTIFF (使用高可用性 Python 算法)
         local py_geocode="/home/mihu/gmtsar/DInSAR_v2.3_Delivery/geocode_gdal.py"
+        local geocode_failed=false
         if [ -f unwrap_detrended.grd ]; then
-            python3 "$py_geocode" trans.dat unwrap_detrended.grd "$results_dir/unwrap_detrended.tif" 0.0001 >> "$LOG_FILE" 2>&1 || true
+            if ! python3 "$py_geocode" trans.dat unwrap_detrended.grd "$results_dir/unwrap_detrended.tif" 0.0001 >> "$LOG_FILE" 2>&1; then
+                log_warn "地理编码 unwrap_detrended.grd 失败"
+                geocode_failed=true
+            fi
         fi
         local corr_src=""
         [ -f filtcorr.grd ] && corr_src="filtcorr.grd" || corr_src="corr.grd"
         if [ -n "$corr_src" ] && [ -f "$corr_src" ]; then
-            python3 "$py_geocode" trans.dat "$corr_src" "$results_dir/corr.tif" 0.0001 >> "$LOG_FILE" 2>&1 || true
+            if ! python3 "$py_geocode" trans.dat "$corr_src" "$results_dir/corr.tif" 0.0001 >> "$LOG_FILE" 2>&1; then
+                log_warn "地理编码 $corr_src 失败"
+                geocode_failed=true
+            fi
         fi
         if [ -f los_displacement.grd ]; then
-            python3 "$py_geocode" trans.dat los_displacement.grd "$results_dir/final_data_values.tif" 0.0001 >> "$LOG_FILE" 2>&1 || true
+            if ! python3 "$py_geocode" trans.dat los_displacement.grd "$results_dir/final_data_values.tif" 0.0001 >> "$LOG_FILE" 2>&1; then
+                log_warn "地理编码 los_displacement.grd 失败"
+                geocode_failed=true
+            fi
+        fi
+        if [ "$geocode_failed" = true ]; then
+            log_warn "部分地理编码失败，后续输出可能缺少经纬度坐标产品"
         fi
         
         # ----- 输出 A：前端图层 (Visual) - RGBA GeoTIFF，背景透明 -----
@@ -1074,9 +1116,15 @@ generate_outputs() {
         if [ -f los_displacement_ll.grd ]; then
             gmt grdconvert los_displacement_ll.grd "$results_dir/final_data_values.tif=gd:GTiff" >> "$LOG_FILE" 2>&1
             if command -v gdal_edit.py &>/dev/null; then
-                gdal_edit.py -a_srs EPSG:4326 "$results_dir/final_data_values.tif" 2>> "$LOG_FILE" || true
+                if ! gdal_edit.py -a_srs EPSG:4326 "$results_dir/final_data_values.tif" 2>> "$LOG_FILE"; then
+                    log_warn "gdal_edit.py 设置 EPSG:4326 失败"
+                fi
             elif command -v gdal_translate &>/dev/null; then
-                gdal_translate -a_srs EPSG:4326 "$results_dir/final_data_values.tif" "$results_dir/final_data_values_epsg.tif" 2>> "$LOG_FILE" && mv "$results_dir/final_data_values_epsg.tif" "$results_dir/final_data_values.tif" || true
+                if ! gdal_translate -a_srs EPSG:4326 "$results_dir/final_data_values.tif" "$results_dir/final_data_values_epsg.tif" 2>> "$LOG_FILE"; then
+                    log_warn "gdal_translate 设置 EPSG:4326 失败"
+                elif [ -f "$results_dir/final_data_values_epsg.tif" ]; then
+                    mv "$results_dir/final_data_values_epsg.tif" "$results_dir/final_data_values.tif"
+                fi
             fi
             log_info "数据 GeoTIFF(数值): results/final_data_values.tif (EPSG:4326)"
         fi

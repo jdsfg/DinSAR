@@ -8,12 +8,13 @@
 # 日期: 2026-02-01
 #=============================================================================
 
-set -o pipefail
+set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/deploy_$(date +%Y%m%d_%H%M%S).log"
 GMTSAR_REPO="https://github.com/DONGYUSEN/gmtsar.git"
 GMTSAR_BRANCH="master"
 INSTALL_PREFIX="/usr/local/GMTSAR"
+GMTSAR_SRC=""
 USER_INSTALL=false
 OFFLINE_MODE=false
 CHECK_ONLY=false
@@ -171,7 +172,7 @@ main() {
 
     # 3. 编译
     log "开始编译..."
-    cd "$GMTSAR_SRC"
+    cd "$GMTSAR_SRC" || error "无法进入源码目录: $GMTSAR_SRC"
     
     # 清理旧的编译结果，确保我们的修复生效
     make clean > /dev/null 2>&1
@@ -180,14 +181,15 @@ main() {
     CFLAGS="-fcommon -O2" ./configure --prefix="$INSTALL_PREFIX" >> "$LOG_FILE" 2>&1
     
     # 编译
-    make >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
+    if ! make >> "$LOG_FILE" 2>&1; then
         error "编译失败，请查看日志: $LOG_FILE"
     fi
     
     # 4. 安装
     log "安装中..."
-    make install >> "$LOG_FILE" 2>&1
+    if ! make install >> "$LOG_FILE" 2>&1; then
+        error "make install 失败，请查看日志: $LOG_FILE"
+    fi
     
     # 5. 安装 run_dinsar.sh
     log "安装数据处理脚本..."
@@ -225,9 +227,9 @@ main() {
     done
     
     if [ "$verify_ok" = true ]; then
-        log "✅ 安装验证通过"
+        log "安装验证通过"
     else
-        log "⚠️  部分命令未找到，请检查编译日志"
+        error "安装验证失败: 部分关键命令未找到，请检查编译日志: $LOG_FILE"
     fi
     
     log "部署成功!"

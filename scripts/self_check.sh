@@ -29,9 +29,11 @@ rm -rf "$HOME/.local/gmtsar"
 
 # 2) 重装
 log "2/5 执行安装"
-cd "$INSTALLER_DIR"
+cd "$INSTALLER_DIR" || fail "无法进入安装目录: $INSTALLER_DIR"
 chmod +x ./install.sh
-./install.sh --user
+if ! ./install.sh --user; then
+    fail "安装失败，请检查日志"
+fi
 source ~/.bashrc >/dev/null 2>&1 || true
 export PATH="$HOME/.local/gmtsar/bin:$PATH"
 
@@ -39,7 +41,10 @@ export PATH="$HOME/.local/gmtsar/bin:$PATH"
 log "3/5 冒烟验证"
 which make_slc_dj1 >/dev/null || fail "make_slc_dj1 不在 PATH"
 which xcorr >/dev/null || fail "xcorr 不在 PATH"
-snaphu >/tmp/self_check_snaphu.out 2>&1 || true
+if ! snaphu 2>/tmp/self_check_snaphu.out; then
+    log "注意: snaphu 无参数返回非零是正常行为，仅验证存在性"
+fi
+command -v snaphu >/dev/null || fail "snaphu 不在 PATH"
 gmt --version >/dev/null || fail "gmt 不可用"
 
 # 4) 选择测试数据并回归
@@ -75,7 +80,9 @@ cp "$DATA_DIR"/*.xml "$VERIFY_DIR/raw/"
 cp "$DATA_DIR"/*.tiff "$VERIFY_DIR/raw/" 2>/dev/null || cp "$DATA_DIR"/*.tif "$VERIFY_DIR/raw/"
 
 chmod +x "$INSTALLER_DIR/run_dinsar.sh"
-(time "$INSTALLER_DIR/run_dinsar.sh" --mode A --auto "$VERIFY_DIR")
+if ! (time "$INSTALLER_DIR/run_dinsar.sh" --mode A --auto "$VERIFY_DIR"); then
+    fail "回归测试 run_dinsar.sh 失败 (退出码: $?)"
+fi
 
 # 5) 验证成果
 log "5/5 校验结果"
