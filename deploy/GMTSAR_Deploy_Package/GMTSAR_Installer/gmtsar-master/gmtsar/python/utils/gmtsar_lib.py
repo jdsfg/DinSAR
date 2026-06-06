@@ -91,17 +91,17 @@ def file_shuttle(fn0, fn1, opt):
     # copy/move fn0 and paste it to fn1.
     if opt == "cp":
         print("cp " + fn0 + " " + fn1)
-        os.system("cp " + fn0 + " " + fn1)
+        subprocess.run(["cp", fn0, fn1], check=False)
     elif opt == "mv":
         print("mv " + fn0 + " " + fn1)
-        os.system("mv " + fn0 + " " + fn1)
+        subprocess.run(["mv", fn0, fn1], check=False)
     elif opt == "link":
         print("ln -sf " + fn0 + " " + fn1)
-        os.system("ln -sf " + fn0 + " " + fn1)
+        subprocess.run(["ln", "-sf", fn0, fn1], check=False)
 
 def delete(fn):
     # delete file named fn.
-    os.system("rm -rf "+fn)
+    subprocess.run(["rm", "-rf", "--", fn], check=False)
     
 def assign_arg(arg, str):
     # arg is the list that contains arguments from a terminal input.
@@ -117,7 +117,7 @@ def run(cmd):
     # run and print the command specified in cmd.
     print(" ")
     print(cmd)
-    os.system(cmd)
+    subprocess.run(cmd, shell=True, check=False)
 
 def renameMasterAlignedForS1tops(master0, aligned0):
     print('Renaming master and aligned for SAT==S1_TOPS')

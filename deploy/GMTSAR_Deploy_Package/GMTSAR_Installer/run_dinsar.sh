@@ -13,7 +13,7 @@
 # 日期: 2026-01-28
 #=============================================================================
 
-set -o pipefail
+set -euo pipefail
 
 #-----------------------------------------------------------------------------
 # 全局变量
@@ -571,9 +571,8 @@ run_filter() {
             error_exit "phasefilt 输入文件缺失或为空 (real/imag/amp)"
         fi
 
-        local phasefilt_cmd="phasefilt -imag $IMAG_FILE -real $REAL_FILE -amp1 $AMP_FILE -amp2 $AMP_FILE -psize 32"
-        log_info "执行: $phasefilt_cmd"
-        eval "$phasefilt_cmd" >> "$LOG_FILE" 2>&1
+        log_info "执行: phasefilt -imag $IMAG_FILE -real $REAL_FILE -amp1 $AMP_FILE -amp2 $AMP_FILE -psize 32"
+        phasefilt -imag "$IMAG_FILE" -real "$REAL_FILE" -amp1 "$AMP_FILE" -amp2 "$AMP_FILE" -psize 32 >> "$LOG_FILE" 2>&1
         local phasefilt_rc=$?
         if [ $phasefilt_rc -ne 0 ]; then
             error_exit "phasefilt 失败 (退出码: $phasefilt_rc)，请检查日志"
@@ -671,7 +670,7 @@ run_unwrap() {
     local unwrap_start=$(date +%s)
     
     # 运行 snaphu
-    eval "$snaphu_cmd" >> "$LOG_FILE" 2>&1
+    $snaphu_cmd >> "$LOG_FILE" 2>&1
     
     if [ $? -ne 0 ]; then
         log_error "snaphu 失败，查看日志: $LOG_FILE"

@@ -8,10 +8,10 @@ read answer
 if [ "X$answer" = "Xn" ]; then
         exit 0
 fi
-here=`pwd`
-sharedir=`gmtsar_sharedir.csh`
-bin=`which gmtsar_sharedir.csh`
-dir=`dirname $bin`
+here="$(pwd)"
+sharedir="$(gmtsar_sharedir.csh)"
+bin="$(which gmtsar_sharedir.csh)"
+dir="$(dirname "$bin")"
 modules="ALOS_fbd2fbs ALOS_fbd2fbs_SLC ALOS_fbd2ss ALOS_merge \
 	ALOS_pre_process ALOS_pre_process_SLC ALOS_pre_process_SS ENVI_baseline ENVI_llt2rat ENVI_look \
 	ENVI_pre_process ERS_baseline ERS_llt2rat ERS_pre_process SAT_baseline SAT_llt2rat SAT_look \
@@ -28,9 +28,13 @@ modules="ALOS_fbd2fbs ALOS_fbd2fbs_SLC ALOS_fbd2ss ALOS_merge \
 	read_data_file_dpaf read_sarleader_dpaf resamp sarp.csh sbas slc2amp.csh snaphu snaphu.csh \
 	snaphu_interp.csh stack.csh stack_corr.csh update_PRM.csh xcorr gmtsar_uninstall.sh"
 
-printf "Remove: %s\n" $sharedir >&2
-sudo rm -rf $sharedir
-cd $dir
+printf "Remove: %s\n" "$sharedir" >&2
+if [ -z "$sharedir" ] || [ "$sharedir" = "/" ]; then
+	printf "ERROR: sharedir is empty or root, aborting.\n" >&2
+	exit 1
+fi
+sudo rm -rf "$sharedir"
+cd "$dir"
 for exe in ${modules}; do
 	printf "Remove: %s\n" $exe >&2
 	sudo rm -f ${exe}

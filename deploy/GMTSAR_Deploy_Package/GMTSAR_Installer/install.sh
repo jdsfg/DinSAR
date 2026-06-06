@@ -8,7 +8,7 @@
 # 日期: 2026-02-01
 #=============================================================================
 
-set -o pipefail
+set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/deploy_$(date +%Y%m%d_%H%M%S).log"
 GMTSAR_REPO="https://github.com/DONGYUSEN/gmtsar.git"

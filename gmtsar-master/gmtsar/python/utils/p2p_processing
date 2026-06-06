@@ -631,7 +631,7 @@ def P2P4MakeFilterInterferograms(ref, rep, topo_phase, shift_topo, range_dec, az
         
         if (iono_skip_est == 0):
             if (mask_water == 1 or switch_land == 1):
-                output = subprocess.check_output('gmt grdinfo phase.grd -I-', shell=True)
+                output = subprocess.check_output(['gmt', 'grdinfo', 'phase.grd', '-I-'])
                 rcut = output[2:20].decode('utf-8')
                 
                 os.chdir('../../topo')

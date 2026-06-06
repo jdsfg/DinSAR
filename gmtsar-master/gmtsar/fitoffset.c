@@ -371,7 +371,7 @@ void replace_multi_space_with_single_space(char *str) {
 /* Run gmt trend2d and collect the parameters */
 int run_gmt_trend(char *file, int n_model_params, double *coefficient1, double *coefficient2, double *coefficient3) {
 
-	char cmd_line[MAX_PATH] = "gmt trend2d /tmp/r.xyz.ZBbxXu -Fxyz -N\"2\"r -V >  /dev/null";
+	char cmd_line[MAX_PATH] = {0};
 	// char buffer[1000];
 	FILE *pipe;
 	// int len;
