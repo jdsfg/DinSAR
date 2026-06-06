@@ -47,7 +47,7 @@ endif
 echo "Converting to TIFF..."
 
 if ("$mode" == "pixel") then
-    gmt grdimage $grd -R$xmin/$xmax/$ymin/$ymax -J$proj -C$cpt  -A$out=Gtiff
+    gmt grdimage $grd -R$xmin/$xmax/$ymin/$ymax -J$proj -C$cpt  -Atest.tif=Gtiff
 else
     #echo "gmt grdimage $grd -R$xmin/$xmax/$ymin/$ymax -J$proj -C$cpt # -B0"
     gmt grdimage $grd -R$xmin/$xmax/$ymin/$ymax -J$proj -C$cpt  -B0 > $base.ps
@@ -55,9 +55,7 @@ else
 endif
 
 # 重命名和清理
-if ("$mode" != "pixel" && -f "$base.tiff") then
-    mv -f "$base.tiff" "$out"
-endif
+# mv $base.tiff $out
 rm -f $base.ps gmt.history gmt.conf
 
 echo "Done: $out created"

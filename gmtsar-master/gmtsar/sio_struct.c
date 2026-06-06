@@ -1,3 +1,5 @@
+/* Global variable definitions */
+
 /************************************************************************
  * routines for handling sio struct in PRM files                        *
  ************************************************************************/
@@ -15,14 +17,19 @@
 
 #include "gmtsar.h"
 #include "lib_functions.h"
+#ifndef GMT_LONG
+
+#endif
 
 /* Global variable definitions */
 long gmt_m[3];
 long gmt_n[3];
 
 /* 定义全局变量 */
+// --- FIX START: 定义全局变量 ---
 int verbose = 0;
 int debug = 0;
+// --- FIX END ---
 
 /*---------------------------------------------------------------*/
 int get_prm(struct PRM *p, char *filename) {

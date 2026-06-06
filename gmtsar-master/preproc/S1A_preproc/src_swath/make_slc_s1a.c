@@ -168,15 +168,11 @@ int write_orb(state_vector *sv, FILE *fp, int n) {
 }
 
 int pop_led(tree *xml_tree, state_vector *sv) {
-	int i, count, ret;
+	int i, count;
 	char tmp_c[200];
 	double tmp_d;
 
-	ret = search_tree(xml_tree, "/product/generalAnnotation/orbitList/", tmp_c, 3, 0, 1);
-	if (ret < 0) {
-		fprintf(stderr, "Error: Cannot find orbitList in XML\n");
-		return -1;
-	}
+	search_tree(xml_tree, "/product/generalAnnotation/orbitList/", tmp_c, 3, 0, 1);
 	count = (int)str2double(tmp_c);
 	if (count > 200) {
         printf("Warning: Too many state vectors (%d). Truncating to 200 to prevent crash.\n", count);
@@ -217,14 +213,13 @@ int pop_prm(struct PRM *prm, tree *xml_tree, char *file_name) {
 	prm->first_line = 1;
 	prm->st_rng_bin = 1;
 
-	int ret = search_tree(xml_tree,
+	search_tree(xml_tree,
 	            "/product/imageAnnotation/processingInformation/swathProcParamsList/"
 	            "swathProcParams/rangeProcessing/numberOfLooks/",
 	            tmp_c, 1, 0, 1);
-	if (ret >= 0 && strlen(tmp_c) > 0) {
+	if (strlen(tmp_c) > 0) {
 		prm->nlooks = (int)str2double(tmp_c);
 	} else {
-		fprintf(stderr, "Warning: Cannot find numberOfLooks, using default\n");
 		prm->nlooks = 1; // 默认值
 	}
 	prm->rshift = 0;

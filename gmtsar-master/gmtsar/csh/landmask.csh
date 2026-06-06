@@ -16,6 +16,7 @@ if ($#argv != 1) then
 endif
 set V = ""
 # set V = "-V" #FOR DEBUG
+endif
 
 echo ""
 echo "MAKE LANDMASK -- START"

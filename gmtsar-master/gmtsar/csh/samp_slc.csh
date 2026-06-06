@@ -36,15 +36,15 @@ cp $image.PRM tmp_aligned.PRM
 set ta = `echo $tprf | awk '{if($1>1) print 1;else if($1<1) print 2;else print 0;}'`
 set tr = `echo $trsr | awk '{if($1>1) print 1;else if($1<1) print 2;else print 0;}'`
 
-if ($ta == 2 && "$nprf" != "0") echo "Downsampling along azimuth is not recommended, may cause aliasing ..."
-if ($tr == 2 && "$nrsr" != "0") echo "Downsampling along range   is not recommended, may cause aliasing ..."
+if ($ta == 2 && $nprf != 0) echo "Downsampling along azimuth is not recommended, may cause aliasing ..."
+if ($tr == 2 && $nrsr != 0) echo "Downsampling along range   is not recommended, may cause aliasing ..."
 
-if ("$nrsr" == "0" && "$nprf" == "0") then
+if ($nrsr == 0 && $nprf == 0) then
   echo "specify at least one of new_prf/new_rng_samp_rate to be non-zero to run the script" 
   exit 1
 endif
 
-if ("$nrsr" != "0") then
+if ($nrsr != 0) then
   set r = `echo $trsr | awk '{printf("%.10f", -(1 - 1/$1))}'`
   set tmp = `grep num_rng_bins tmp_master.PRM | awk '{print $3}'`
   set new_num_rng_bins = `echo $tmp $trsr | awk '{printf("%d",$1*$2/4)}' | awk '{printf("%d",$1*4)}'`
@@ -56,7 +56,7 @@ if ("$nrsr" != "0") then
   update_PRM tmp_master.PRM good_bytes_per_line $bytes
 endif
 
-if ("$nprf" != "0") then
+if ($nprf != 0) then
   set a = `echo $tprf | awk '{printf("%.10f", -(1 - 1/$1))}'`
   set tmp = `grep num_lines tmp_master.PRM | awk '{print $3}'`
   set new_nl = `echo $tmp $tprf | awk '{printf("%d",$1*$2/4)}' | awk '{printf("%d",$1*4)}'`

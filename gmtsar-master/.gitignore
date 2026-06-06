@@ -258,5 +258,3 @@ preproc/LT1_preproc/src/make_slc_lt1
 preproc/LT1_preproc/src/make_slc_lt1.o
 preproc/LT1_preproc/src_orbit/ext_orb_lt1
 preproc/LT1_preproc/src_orbit/ext_orb_lt1.o
-# 上游整合备份（恢复本地版本时使用）
-.integration_backup_*/

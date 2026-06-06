@@ -48,8 +48,9 @@ echo "  Input DEM:   $dem_file"
 echo "  [1/3] Sampling and correlating phase with elevation..."
 
 # 获取 DEM 的分辨率并重采样相位图以对齐 (防止网格不匹配)
-set R = `gmt grdinfo $unw_file -I-`
-gmt grdsample $dem_file $R -Gtmp_dem_matched.grd
+set REG = `gmt grdinfo $unw_file -I-`
+set INC = `gmt grdinfo $unw_file -I`
+gmt grdsample $dem_file $REG $INC -Gtmp_dem_matched.grd
 
 # 将两者转为 XYZ 并合并，过滤 NaN
 gmt grd2xyz $unw_file -s > tmp_phase.xyz
@@ -95,7 +96,7 @@ echo "  Regression result: Phase = ($slope) * Elevation + ($intercept)"
 echo "  [3/3] Applying correction to grid..."
 # Formula: phase_corr = phase - (slope * elevation + intercept)
 # 有时我们只扣除相关项，保留常数项(归零由后期处理)
-gmt grdmath $unw_file $dem_file $slope MUL SUB = $out_file
+gmt grdmath $unw_file tmp_dem_matched.grd $slope MUL SUB = $out_file
 
 echo "  Atmospheric correction applied: $out_file"
 

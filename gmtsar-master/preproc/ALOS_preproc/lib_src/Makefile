@@ -3,8 +3,8 @@ sinclude ../../../config.mk
 LIB = libALOS.a
 INCLUDES = -I../include
 
-SRCS =	utils.c \
-	globals_alos.c \
+SRCS = globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c globals_alos.c \
+	utils.c \
 	null_sio_struct.c \
 	get_sio_struct.c \
 	put_sio_struct.c \
@@ -37,10 +37,10 @@ $(LIB) : $(OBJS)
 	$(AR) r $(LIB) $?
 	$(RANLIB) $(LIB)
 
-all:	install
+all:    install
 
-install:	$(LIB)
+install:        $(LIB)
 	$(INSTALL) *.a ../lib
 
 clean:
-	rm -f *.a *.o 
+	rm -f *.a *.o

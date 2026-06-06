@@ -501,9 +501,7 @@ set OMP_NUM_THREADS = 12
 
       if ($skip_master == 0 || $skip_master == 1) then
         cp $aligned.PRM $aligned.PRM0
-        if ($SAT != "LT1") then
-          SAT_baseline $master.PRM $aligned.PRM0 >> $aligned.PRM
-        endif
+        SAT_baseline $master.PRM $aligned.PRM0 >> $aligned.PRM
         if ($SAT == "ALOS2_SCAN") then
           xcorr $master.PRM $aligned.PRM -xsearch 32 -ysearch 256 -nx 32 -ny 128
           awk '{print $4}' < freq_xcorr.dat > tmp.dat
@@ -512,7 +510,7 @@ set OMP_NUM_THREADS = 12
           set amin = `echo $amedian | awk '{print $1-3}'`
           awk '{if($4 > '$amin' && $4 < '$amax') print $0}' < freq_xcorr.dat > freq_alos2.dat
           fitoffset.csh 2 3 freq_alos2.dat 10 >> $aligned.PRM
-        else if ($SAT == "ERS" || $SAT == "ENVI" || $SAT == "ALOS" || $SAT == "CSK_RAW" ||  $SAT == "ALOS_SLC") then
+        else if ($SAT == "ERS" || $SAT == "ENVI" || $SAT == "ALOS" || $SAT == "CSK_RAW" || $SAT == "LT1" ||  $SAT == "ALOS_SLC") then
           xcorr $master.PRM $aligned.PRM -xsearch 128 -ysearch 128 -nx 20 -ny 50
           fitoffset.csh 3 3 freq_xcorr.dat 18 >> $aligned.PRM
         else if ($SAT == "DJ1") then  
@@ -528,60 +526,6 @@ set OMP_NUM_THREADS = 12
           # xcorr_fast: 26x 加速, 保持大窗口参数
           xcorr_fast $master.PRM $aligned.PRM -xsearch 256 -ysearch 128 -nx 30 -ny 50
           fitoffset.csh 2 2 freq_xcorr.dat 18 >> $aligned.PRM
-        else if ($SAT == "LT1") then
-          echo "             ..配准 LT1：PRF/DC 归一化 + 大窗口 xcorr2            "
-          set prf_m = `grep PRF $master.PRM | awk 'NR==1{print $3}'`
-          set prf_s = `grep PRF $aligned.PRM | awk 'NR==1{print $3}'`
-          if ("x$prf_m" == "x" || "x$prf_s" == "x") then
-            echo "错误：无法读取 LT1 PRF 参数 / ERROR: failed to read LT1 PRF"
-            exit 1
-          endif
-          set prf_diff_pct = `echo "$prf_m $prf_s" | awk '{m=$1+0;s=$2+0; if(m==0){print 0}else{d=s-m;if(d<0)d=-d; printf("%.4f",100.0*d/m)}}'`
-          set prf_need_norm = `echo "$prf_m $prf_s" | awk '{m=$1+0;s=$2+0; if(m==0){print 0}else{d=s-m;if(d<0)d=-d; if(d/m>0.0005) print 1; else print 0}}'`
-          echo "LT1 PRF check: master=$prf_m aligned=$prf_s diff=${prf_diff_pct}%"
-          if ($prf_need_norm == 1) then
-            echo "LT1 PRF normalization: resample aligned SLC to master PRF=$prf_m"
-            samp_slc.csh $aligned $prf_m 0
-            if ($status != 0) then
-              echo "错误：LT1 PRF 归一化失败 / ERROR: LT1 PRF normalization failed"
-              exit 1
-            endif
-          endif
-
-          set fd1_m = `grep fd1 $master.PRM | awk 'NR==1{print $3}'`
-          set fd1_s = `grep fd1 $aligned.PRM | awk 'NR==1{print $3}'`
-          set fdd1_m = `grep fdd1 $master.PRM | awk 'NR==1{print $3}'`
-          set fdd1_s = `grep fdd1 $aligned.PRM | awk 'NR==1{print $3}'`
-          set fddd1_m = `grep fddd1 $master.PRM | awk 'NR==1{print $3}'`
-          set fddd1_s = `grep fddd1 $aligned.PRM | awk 'NR==1{print $3}'`
-          if ("x$fd1_m" == "x") set fd1_m = 0
-          if ("x$fd1_s" == "x") set fd1_s = 0
-          if ("x$fdd1_m" == "x") set fdd1_m = 0
-          if ("x$fdd1_s" == "x") set fdd1_s = 0
-          if ("x$fddd1_m" == "x") set fddd1_m = 0
-          if ("x$fddd1_s" == "x") set fddd1_s = 0
-          update_PRM $aligned.PRM fd1 $fd1_m
-          update_PRM $aligned.PRM fdd1 $fdd1_m
-          update_PRM $aligned.PRM fddd1 $fddd1_m
-          set dc_diff = `echo "$fd1_m $fd1_s $fdd1_m $fdd1_s $fddd1_m $fddd1_s" | awk '{d1=$2-$1; if(d1<0)d1=-d1; d2=$4-$3; if(d2<0)d2=-d2; d3=$6-$5; if(d3<0)d3=-d3; printf("d_fd1=%.6f d_fdd1=%.6f d_fddd1=%.6f",d1,d2,d3)}'`
-          echo "LT1 DC normalization: aligned -> master (fd1=$fd1_m fdd1=$fdd1_m fddd1=$fddd1_m), $dc_diff"
-
-          # LT1: compute coarse range offset from near_range (SAT_baseline is skipped for LT1)
-          set nr_m = `grep near_range $master.PRM | awk 'NR==1{print $3}'`
-          set nr_a = `grep near_range $aligned.PRM | awk 'NR==1{print $3}'`
-          set rsr_m = `grep rng_samp_rate $master.PRM | awk 'NR==1{print $3}'`
-          set coarse_rshift = `echo "$nr_m $nr_a $rsr_m" | awk '{c=299792458.0; pix=c/(2*$3); printf("%d", ($1-$2)/pix)}'`
-          echo "LT1 coarse offset: rshift=$coarse_rshift (from near_range diff)"
-          update_PRM $aligned.PRM rshift $coarse_rshift
-
-          set OMP_NUM_THREADS = 12
-          xcorr2 $master.PRM $aligned.PRM -nx 30 -ny 30 -xsearch 512 -ysearch 512
-          if ($status != 0) then
-            echo "错误：LT1 粗配准 xcorr2 失败 / ERROR: LT1 coarse xcorr2 failed"
-            exit 1
-          endif
-          fitoffset.csh 2 2 freq_xcorr.dat 20 >> $aligned.PRM
-          update_PRM $aligned.PRM SC_identity 12
         else
           xcorr $master.PRM $aligned.PRM -noshift -xsearch 128 -ysearch 128 -nx 20 -ny 50
           fitoffset.csh 2 2  freq_xcorr.dat 18 >> $aligned.PRM
@@ -961,7 +905,7 @@ echo "3.                     裁减一下图，减少工作量"
       cp phase.grd phasefilt.grd
       if ($iono_skip_est == 0) then
         if ($mask_water == 1 || $switch_land == 1) then
-          set rcut = `gmt grdinfo phase.grd -I- | sed 's#^-R##'`
+          set rcut = `gmt grdinfo phase.grd -I- | cut -c3-20`
           cd ../../topo
           landmask.csh $rcut
           cd ../iono_phase/intf_h
@@ -1061,7 +1005,7 @@ echo "3.                     裁减一下图，减少工作量"
 # landmask
 #
       if ($mask_water == 1 || $switch_land == 1) then
-        set r_cut = `gmt grdinfo phase.grd -I- | sed 's#^-R##'`
+        set r_cut = `gmt grdinfo phase.grd -I- | cut -c3-20`
         cd ../../topo
         if (! -f landmask_ra.grd) then
           landmask.csh $r_cut
@@ -1085,12 +1029,20 @@ echo "3.                     裁减一下图，减少工作量"
       echo "相位解缠结束：SNAPHU.CSH - END"
       
       if ($SAT == "DJ1" || $SAT == "LT1" ||  $SAT == "GF3" ) then 
-        echo "轨道滤波：在解缠后相位中去除 DJ1、LT1、GF3 轨道斜坡 (二阶曲面 N5)......"
-        gmt grdtrend  unwrap.grd -N5+r -Tphase_trend.grd  # N5 = a+bx+cy+dx^2+ey^2
+        echo "测试功能：在解缠后相位中去除 DJ1、LT1、GF3 平行干涉条纹......"
+        gmt grdtrend  unwrap.grd -N3+r -Tphase_trend.grd  # N5 = a+bx+cy+dx^2+ey^2; N3 = a+bx+cy
         gmt grdmath unwrap.grd phase_trend.grd SUB = unwrap_rm_trend.grd
         cp unwrap.grd unwrap.org.grd
         mv unwrap_rm_trend.grd unwrap.grd
-        echo "轨道滤波：完成 (原始保存在 unwrap.org.grd, 趋势保存在 phase_trend.grd)"
+        echo "测试功能：在原始相位中去除相位趋势......，当前没有干活"
+        #gmt grdmath phase.grd phase_trend.grd SUB = phase_rm_trend.grd
+        #gmt grdmath phase_rm_trend 2 PI MUL MOD = wrapped_phase_0_2pi.grd -fg
+        #mv phase.grd phase.org.grd
+        #mv wrapped_phase_0_2pi.grd phase.grd
+        #gmt grdmath phasefilt.grd phase_trend.grd SUB = phasefilt_rm_trend.grd
+        #gmt grdmath phasefilt_rm_trend.grd 2 PI MUL MOD = wrapped_phase_0_2pi.grd -fg
+        #mv phasefilt.grd phasefilt.org.grd
+        #mv wrapped_phase_0_2pi.grd phasefilt.grd
       endif
 
       cd ../..

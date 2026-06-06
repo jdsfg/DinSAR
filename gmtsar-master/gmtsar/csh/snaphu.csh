@@ -53,11 +53,11 @@ import subprocess
 import numpy as np
 
 # Get phase data
-result = subprocess.run(['gmt', 'grd2xyz', '$phasefile', '-ZBLf'], capture_output=True)
+result = subprocess.run(['gmt', 'grd2xyz', '$phasefile', '-ZTLf'], capture_output=True)
 phase = np.frombuffer(result.stdout, dtype=np.float32).copy()
 
 # Get corr data
-result = subprocess.run(['gmt', 'grd2xyz', '$corrfile', '-ZBLf'], capture_output=True)
+result = subprocess.run(['gmt', 'grd2xyz', '$corrfile', '-ZTLf'], capture_output=True)
 corr = np.frombuffer(result.stdout, dtype=np.float32).copy()
 
 # Replace NaN with 0
@@ -79,9 +79,9 @@ if ( $status != 0 ) then
     exit 1
 endif
 
-# Run SNAPHU (linelength = nrows for row-major data)
+# Run SNAPHU (linelength = ncols for row-major data)
 echo "  Running SNAPHU unwrapping..."
-snaphu phase.in $nrows -d -c corr.in -o unwrap.out
+snaphu phase.in $ncols -d -c corr.in -o unwrap.out
 
 if ( ! -f unwrap.out ) then
     echo "ERROR: SNAPHU failed to produce output"

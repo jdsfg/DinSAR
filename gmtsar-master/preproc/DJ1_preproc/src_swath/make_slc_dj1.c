@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
 
 	FILE *XML_FILE, *OUTPUT_PRM, *OUTPUT_SLC, *OUTPUT_LED;
 	TIFF *TIFF_FILE;
-	char tmp_str[200];
+	char tmp_str[2048];
 	struct PRM prm;
 	tree *xml_tree;
 	state_vector sv[2000];
@@ -74,8 +74,7 @@ int main(int argc, char **argv) {
 	// generate the PRM file
 	pop_prm(&prm, xml_tree, argv[3]);
 
-	strcpy(tmp_str, argv[3]);
-	strcat(tmp_str, ".PRM");
+	snprintf(tmp_str, sizeof(tmp_str), "%s.PRM", argv[3]);
 	if ((OUTPUT_PRM = fopen(tmp_str, "w")) == NULL)
 		die("无法打开文件 Couldn't open prm file: \n", tmp_str);
 	put_sio_struct(prm, OUTPUT_PRM);
@@ -85,8 +84,7 @@ int main(int argc, char **argv) {
 	n = pop_led(xml_tree, sv);
 
 
-	strcpy(tmp_str, argv[3]);
-	strcat(tmp_str, ".LED");
+	snprintf(tmp_str, sizeof(tmp_str), "%s.LED", argv[3]);
 	printf("写入轨道信息 Writing  orbit ... %s \n", tmp_str);
 	
 	if ((OUTPUT_LED = fopen(tmp_str, "w")) == NULL)
@@ -99,8 +97,7 @@ int main(int argc, char **argv) {
 	if ((TIFF_FILE = TIFFOpen(argv[2], "r")) == NULL)
 		die("无法打开文件 Couldn't open tiff file: \n", argv[2]);
 
-	strcpy(tmp_str, argv[3]);
-	strcat(tmp_str, ".SLC");
+	snprintf(tmp_str, sizeof(tmp_str), "%s.SLC", argv[3]);
 	if ((OUTPUT_SLC = fopen(tmp_str, "wb")) == NULL)
 		die("无法打开文件 Couldn't open slc file: \n", tmp_str);
 	write_slc(TIFF_FILE, OUTPUT_SLC);
@@ -279,15 +276,14 @@ int pop_prm(struct PRM *prm, tree *xml_tree, char *file_name) {
 
 	search_tree(xml_tree, "/product/generalAnnotation/productInformation/pass/", tmp_c, 1, 0, 1);
 	strasign(prm->orbdir, tmp_c, 0, 0);
-	/*
-	search_tree(xml_tree, "/product/imageAnnotation/imageInformation/look_side/", tmp_c, 1, 0, 1); //no look_side after 2023
-	//printf("look_side: %s", tmp_c)
-    if (strcmp(tmp_c, "left") == 0) 
-		strasign(prm->lookdir, "L", 0, 0); 
-	else 
-        strasign(prm->lookdir, "R", 0, 0);
-    */
-    strasign(prm->lookdir, "L", 0, 0);
+	ret = search_tree(xml_tree, "/product/imageAnnotation/imageInformation/look_side/", tmp_c, 1, 0, 1);
+	if (ret > 0 && (strcmp(tmp_c, "left") == 0 || strcmp(tmp_c, "Left") == 0 || strcmp(tmp_c, "LEFT") == 0)) {
+		strcpy(prm->lookdir, "L");
+	} else if (ret > 0 && (strcmp(tmp_c, "right") == 0 || strcmp(tmp_c, "Right") == 0 || strcmp(tmp_c, "RIGHT") == 0)) {
+		strasign(prm->lookdir, "R", 0, 0);
+	} else {
+		strasign(prm->lookdir, "L", 0, 0);
+	}
 	
 
 	strcpy(tmp_c, file_name);
@@ -355,9 +351,12 @@ int pop_prm(struct PRM *prm, tree *xml_tree, char *file_name) {
 	prm->num_rng_bins = prm->bytes_per_line / 4;
 	prm->chirp_ext = 0;
 
-	// add by dong 2025.12.27
-	// prm->pulsedur = prm->num_rng_bins / prm->fs;
-	prm->pulsedur = 0.000026800000; //from new xml file, we find this value, and hope it keep stable.
+	ret = search_tree(xml_tree, "/product/generalAnnotation/downlinkInformationList/downlinkInformation/downlinkValues/txPulseLength/", tmp_c, 1, 0, 1);
+	if (ret >= 0) {
+		prm->pulsedur = str2double(tmp_c);
+	} else {
+		prm->pulsedur = 0.000026800000; //fallback
+	}
 	search_tree(xml_tree,
 	            "/product/imageAnnotation/processingInformation/swathProcParamsList/"
 	            "swathProcParams/rangeProcessing/lookBandwidth/",
