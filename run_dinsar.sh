@@ -32,7 +32,7 @@ SLAVE_DATE=""
 MASTER_XML=""
 SLAVE_XML=""
 SATELLITE_TYPE="BC3"
-WAVELENGTH=0.0311  # X波段默认值 (m)
+WAVELENGTH=""  # 将从 PRM 文件自动读取
 
 # 处理参数
 PROCESS_MODE="FAST"  # FAST/ STANDARD/ QUALITY
@@ -56,7 +56,7 @@ CROP_MODE=false
 SNAPHU_TILES="2 2"
 SNAPHU_OVERLAP="200"
 SNAPHU_NPROC=8
-DETREND_ORDER=6
+DETREND_ORDER=3
 
 # 运行时变量
 LOG_FILE=""
@@ -442,6 +442,17 @@ generate_slc() {
         python3 "$PROJECT_DIR/SLC/fix_prm.py" "${MASTER_DATE}.PRM" "$MASTER_XML" "${MASTER_DATE}.LED" >> "$LOG_FILE" 2>&1
         log_info "修复辅影像 PRM 文件参数..."
         python3 "$PROJECT_DIR/SLC/fix_prm.py" "${SLAVE_DATE}.PRM" "$SLAVE_XML" "${SLAVE_DATE}.LED" >> "$LOG_FILE" 2>&1
+    fi
+    
+    # 动态读取雷达波长 (P0: 波长硬编码修复)
+    local prm_wave
+    prm_wave=$(grep "radar_wavelength" "${MASTER_DATE}.PRM" 2>/dev/null | awk '{print $3}')
+    if [ -n "$prm_wave" ]; then
+        WAVELENGTH="$prm_wave"
+        log_info "从 PRM 动态读取雷达波长: $WAVELENGTH m"
+    else
+        WAVELENGTH=0.0311
+        log_warn "未找到雷达波长，使用默认值: $WAVELENGTH m"
     fi
     
     log_info "SLC 生成完成"
@@ -1122,44 +1133,70 @@ generate_outputs() {
     fi
 
     # PNG 输出（使用动态范围）
-    log_info "生成可视化图像..."
+    log_info "生成可视化图像 (Safe Python Renderer)..."
     
-    # 干涉条纹图
-    if [ -f "$FILT_PHASE" ]; then
-        local pmin=$(gmt grdinfo "$FILT_PHASE" -C 2>/dev/null | awk '{print $6}')
-        local pmax=$(gmt grdinfo "$FILT_PHASE" -C 2>/dev/null | awk '{print $7}')
-        if [ -n "$pmin" ] && [ -n "$pmax" ] && [ "$pmin" != "NaN" ] && [ "$pmax" != "NaN" ] && [ "$pmin" != "$pmax" ]; then
-            gmt begin "$results_dir/interferogram" png E100 >> "$LOG_FILE" 2>&1
-            gmt makecpt -Ccyclic -T"$pmin"/"$pmax" > phase.cpt 2>> "$LOG_FILE"
-            gmt grdimage "$FILT_PHASE" -JX15c -Cphase.cpt -Baf >> "$LOG_FILE" 2>&1
-            gmt colorbar -Cphase.cpt -DJBC+w12c/0.4c -Baf+l"Phase (rad)" >> "$LOG_FILE" 2>&1
-            gmt end >> "$LOG_FILE" 2>&1
-            log_info "干涉条纹图: results/interferogram.png"
-        else
-            log_warn "相位数据范围不足或全为零，跳过干涉条纹图生成"
-        fi
-    fi
+    cat > make_safe_thumbnails.py << 'EOF'
+import sys
+import numpy as np
+from osgeo import gdal
+from PIL import Image
+
+def arr_to_img(data, cmap_name, vmin, vmax, width=800):
+    h, w = data.shape
+    scale = width / w
+    new_h = int(h * scale)
+    norm = (data - vmin) / (vmax - vmin)
+    norm = np.clip(norm, 0, 1)
     
-    # 位移图
-    if [ -f los_displacement.grd ]; then
-        local dmin2=$(gmt grdinfo los_displacement.grd -C 2>/dev/null | awk '{printf "%.1f", $6}')
-        local dmax2=$(gmt grdinfo los_displacement.grd -C 2>/dev/null | awk '{printf "%.1f", $7}')
-        if [ -n "$dmin2" ] && [ -n "$dmax2" ] && [ "$dmin2" != "NaN" ] && [ "$dmax2" != "NaN" ] && [ "$dmin2" != "$dmax2" ]; then
-            gmt begin "$results_dir/displacement" png E100 >> "$LOG_FILE" 2>&1
-            gmt makecpt -Cpolar -T"$dmin2"/"$dmax2" > disp.cpt 2>> "$LOG_FILE"
-            gmt grdimage los_displacement.grd -JX15c -Cdisp.cpt -Baf >> "$LOG_FILE" 2>&1
-            gmt colorbar -Cdisp.cpt -DJBC+w12c/0.4c -Baf+l"LOS Displacement (mm)" >> "$LOG_FILE" 2>&1
-            gmt end >> "$LOG_FILE" 2>&1
-            log_info "位移图: results/displacement.png"
-        else
-            log_warn "位移数据范围不足或全为零，跳过位移图生成"
-        fi
+    if cmap_name == 'hsv':
+        hue = norm
+        from colorsys import hsv_to_rgb
+        rgb = np.zeros((*data.shape, 3), dtype=np.uint8)
+        for i in range(data.shape[0]):
+            for j in range(data.shape[1]):
+                r, g, b = hsv_to_rgb(hue[i,j], 1.0, 1.0)
+                rgb[i,j] = [int(r*255), int(g*255), int(b*255)]
+    elif cmap_name == 'RdBu_r':
+        rgb = np.zeros((*data.shape, 3), dtype=np.uint8)
+        rgb[:,:,0] = np.clip((norm * 2 * 255), 0, 255).astype(np.uint8)
+        rgb[:,:,1] = np.clip((1 - np.abs(norm*2 - 1)) * 255, 0, 255).astype(np.uint8)
+        rgb[:,:,2] = np.clip(((1-norm) * 2 * 255), 0, 255).astype(np.uint8)
+    else:
+        val = (norm * 255).astype(np.uint8)
+        rgb = np.stack([val, val, val], axis=-1)
+        
+    img = Image.fromarray(rgb)
+    img = img.resize((width, new_h), Image.NEAREST)
+    return img
+
+try:
+    ds1 = gdal.Open(sys.argv[1])
+    if ds1:
+        pf = ds1.GetRasterBand(1).ReadAsArray()
+        img1 = arr_to_img(pf, 'hsv', -np.pi, np.pi)
+        img1.save(sys.argv[2])
+except Exception as e:
+    print("Phase render error:", e)
+
+try:
+    ds2 = gdal.Open(sys.argv[3])
+    if ds2:
+        disp = ds2.GetRasterBand(1).ReadAsArray()
+        d_min, d_max = np.nanmin(disp), np.nanmax(disp)
+        limit = max(abs(d_min), abs(d_max)) if not np.isnan(d_min) else 50
+        img2 = arr_to_img(disp, 'RdBu_r', -limit, limit)
+        img2.save(sys.argv[4])
+except Exception as e:
+    print("Disp render error:", e)
+EOF
+    python3 make_safe_thumbnails.py "$FILT_PHASE" "$results_dir/interferogram.png" "los_displacement.grd" "$results_dir/displacement.png" >> "$LOG_FILE" 2>&1
+    log_info "干涉条纹图: results/interferogram.png"
+    log_info "位移图: results/displacement.png"
         # 雷达坐标 GeoTIFF（无地理编码时保留）
-        if [ "$have_trans" -eq 0 ]; then
+        if [ "$have_trans" -eq 0 ] && [ -f los_displacement.grd ]; then
             gmt grdconvert los_displacement.grd "$results_dir/displacement.tif=gd:GTiff" >> "$LOG_FILE" 2>&1
             log_info "GeoTIFF(雷达坐标): results/displacement.tif"
         fi
-    fi
     
     # 复制关键文件到结果目录
     cp -f los_displacement.grd "$results_dir/" 2>/dev/null
