@@ -37,7 +37,7 @@ WAVELENGTH=""  # 将从 PRM 文件自动读取
 # 处理参数
 PROCESS_MODE="FAST"  # FAST/ STANDARD/ QUALITY
 UNWRAP_MODE="A"      # A=稳定模式, B=高精度模式（由 PROCESS_MODE 映射）
-ATM_MODE="EMPIRICAL" # NONE/ EMPIRICAL (Phase-Elev)/ GACOS / ST_FILTER
+ATM_MODE="NONE" # P1-6: 默认关闭全局线性大气校正，防止引入新误差
 GACOS_PATH=""        # GACOS 数据目录 (.ztd + .rsc)
 REF_PX=""            # 参考点 Range 坐标 (可选，GACOS 模式使用)
 REF_PY=""            # 参考点 Azimuth 坐标 (可选，GACOS 模式使用)
@@ -56,7 +56,7 @@ CROP_MODE=false
 SNAPHU_TILES="2 2"
 SNAPHU_OVERLAP="200"
 SNAPHU_NPROC=8
-DETREND_ORDER=3
+DETREND_ORDER=1
 
 # 运行时变量
 LOG_FILE=""
@@ -518,6 +518,16 @@ run_alignment() {
         log_warn "fitoffset.csh 不可用或 freq_xcorr.dat 不存在，跳过偏移拟合"
     fi
     
+    # 核心修复 [P0-1]: 执行 resamp 共配准重采样 (没有重采样会极大降低相干性)
+    log_info "执行 resamp 共配准重采样..."
+    local slave_rs_prm="${SLAVE_DATE}RS.PRM"
+    local slave_rs_slc="${SLAVE_DATE}RS.SLC"
+    resamp "$master_prm" "$slave_prm" "$slave_rs_prm" "$slave_rs_slc" 4 >> "$LOG_FILE" 2>&1
+    if [ ! -f "$slave_rs_prm" ] || [ ! -f "$slave_rs_slc" ]; then
+        error_exit "resamp 失败 (无法生成 $slave_rs_prm)"
+    fi
+    log_info "重采样完成: $slave_rs_prm"
+    
     log_info "配准完成"
 }
 
@@ -540,8 +550,14 @@ run_interferogram() {
     # 链接 PRM 和 SLC 文件
     ln -sf "$PROJECT_DIR/SLC/${MASTER_DATE}.PRM" .
     ln -sf "$PROJECT_DIR/SLC/${MASTER_DATE}.SLC" .
-    ln -sf "$PROJECT_DIR/SLC/${SLAVE_DATE}.PRM" .
-    ln -sf "$PROJECT_DIR/SLC/${SLAVE_DATE}.SLC" .
+    if [ -f "$PROJECT_DIR/SLC/${SLAVE_DATE}RS.PRM" ]; then
+        ln -sf "$PROJECT_DIR/SLC/${SLAVE_DATE}RS.PRM" "${SLAVE_DATE}.PRM"
+        ln -sf "$PROJECT_DIR/SLC/${SLAVE_DATE}RS.SLC" "${SLAVE_DATE}.SLC"
+        log_info "使用已重采样的从影像进行干涉"
+    else
+        ln -sf "$PROJECT_DIR/SLC/${SLAVE_DATE}.PRM" .
+        ln -sf "$PROJECT_DIR/SLC/${SLAVE_DATE}.SLC" .
+    fi
     ln -sf "$PROJECT_DIR/SLC/${MASTER_DATE}.LED" . 2>/dev/null
     ln -sf "$PROJECT_DIR/SLC/${SLAVE_DATE}.LED" . 2>/dev/null
 
@@ -557,7 +573,7 @@ run_interferogram() {
     if [ -f "$dem_grd" ]; then
         if [ ! -f dem_ra.grd ]; then
             log_info "生成雷达坐标 DEM (dem_ra.grd) 以去除地形相位..."
-            bash /home/mihu/gmtsar/DInSAR_v2.3_Delivery/fast_dem2topo_ra.sh "${MASTER_DATE}.PRM" "$dem_grd" "$LOG_FILE"
+            bash "$SCRIPT_DIR/fast_dem2topo_ra.sh" "${MASTER_DATE}.PRM" "$dem_grd" "$LOG_FILE"
         fi
         if [ -f dem_ra.grd ]; then
             # 核心修复: 替换 dem_ra.grd 中的 NaN 值为 0，防止 phasediff.c 的 calc_average_topo 算得 NaN 导致全图变 NaN/0
@@ -718,12 +734,7 @@ run_unwrap() {
     fi
 
     if [ -f "$corr_source" ]; then
-        log_info "生成相干性硬掩膜 (阈值=0.20): $corr_source"
-        gmt grdmath "$corr_source" 0.20 GE = coh_mask.grd >> "$LOG_FILE" 2>&1
-        gmt grdmath "$FILT_PHASE" coh_mask.grd MUL 0 AND = phase_masked.grd >> "$LOG_FILE" 2>&1
-        if [ -f phase_masked.grd ]; then
-            phase_for_unwrap="phase_masked.grd"
-        fi
+        log_info "跳过生成相干性硬掩膜(P1-4)，交由 snaphu 统计代价模型自适应处理低相干区"
     fi
 
     # 转换为二进制格式并安全替换 NaN 值为 0 (防止 snaphu 崩溃)
@@ -735,8 +746,8 @@ run_unwrap() {
         gmt grd2xyz corr_no_nan.grd -ZTLf > corr.bin 2>> "$LOG_FILE"
     fi
     
-    # 构建 snaphu 命令
-    local snaphu_cmd=("snaphu" "phase.bin" "$ncols" "-o" "unwrap.bin")
+    # 构建 snaphu 命令 (P0-2: 添加 -s 强制开启 SMOOTH 形变代价模式)
+    local snaphu_cmd=("snaphu" "phase.bin" "$ncols" "-o" "unwrap.bin" "-s")
     local snaphu_conf=""
     local conf_candidates=(
         "/usr/local/GMTSAR/share/gmtsar/snaphu/config/snaphu.conf.brief"
@@ -1082,7 +1093,7 @@ generate_outputs() {
             proj_csh="proj_ra2ll.csh"
         fi
         # 雷达坐标 -> 经纬度 GeoTIFF (使用高可用性 Python 算法)
-        local py_geocode="/home/mihu/gmtsar/DInSAR_v2.3_Delivery/geocode_gdal.py"
+        local py_geocode="$SCRIPT_DIR/geocode_gdal.py"
         if [ -f unwrap_detrended.grd ]; then
             python3 "$py_geocode" trans.dat unwrap_detrended.grd "$results_dir/unwrap_detrended.tif" 0.0001 >> "$LOG_FILE" 2>&1 || true
         fi
@@ -1095,39 +1106,6 @@ generate_outputs() {
             python3 "$py_geocode" trans.dat los_displacement.grd "$results_dir/final_data_values.tif" 0.0001 >> "$LOG_FILE" 2>&1 || true
         fi
         
-        # ----- 输出 A：前端图层 (Visual) - RGBA GeoTIFF，背景透明 -----
-        # 位移：Jet 色表；相干：Gray 色表；grdimage -A -Q 生成带地理坐标的渲染图
-        if [ -f los_displacement_ll.grd ]; then
-            local dmin dmax
-            dmin=$(gmt grdinfo los_displacement_ll.grd -C 2>/dev/null | awk '{print $6}')
-            dmax=$(gmt grdinfo los_displacement_ll.grd -C 2>/dev/null | awk '{print $7}')
-            [ -z "$dmin" ] && dmin=-100
-            [ -z "$dmax" ] && dmax=100
-            gmt makecpt -Cjet -T"$dmin"/"$dmax" -Z > def_layer.cpt 2>> "$LOG_FILE"
-            gmt grdimage los_displacement_ll.grd -Rlos_displacement_ll.grd -JM15c -Cdef_layer.cpt -Q -A"$results_dir/final_layer_deformation.tif" >> "$LOG_FILE" 2>&1
-            log_info "前端图层(位移): results/final_layer_deformation.tif"
-        fi
-        if [ -f corr_ll.grd ]; then
-            local cmin cmax
-            cmin=$(gmt grdinfo corr_ll.grd -C 2>/dev/null | awk '{print $6}')
-            cmax=$(gmt grdinfo corr_ll.grd -C 2>/dev/null | awk '{print $7}')
-            [ -z "$cmin" ] && cmin=0
-            [ -z "$cmax" ] && cmax=1
-            gmt makecpt -Cgray -T"$cmin"/"$cmax" -Z > coh_layer.cpt 2>> "$LOG_FILE"
-            gmt grdimage corr_ll.grd -Rcorr_ll.grd -JM15c -Ccoh_layer.cpt -Q -A"$results_dir/final_layer_coherence.tif" >> "$LOG_FILE" 2>&1
-            log_info "前端图层(相干): results/final_layer_coherence.tif"
-        fi
-        
-        # ----- 输出 B：后端数据 (Data) - 纯数值 GeoTIFF，EPSG:4326 -----
-        if [ -f los_displacement_ll.grd ]; then
-            gmt grdconvert los_displacement_ll.grd "$results_dir/final_data_values.tif=gd:GTiff" >> "$LOG_FILE" 2>&1
-            if command -v gdal_edit.py &>/dev/null; then
-                gdal_edit.py -a_srs EPSG:4326 "$results_dir/final_data_values.tif" 2>> "$LOG_FILE" || true
-            elif command -v gdal_translate &>/dev/null; then
-                gdal_translate -a_srs EPSG:4326 "$results_dir/final_data_values.tif" "$results_dir/final_data_values_epsg.tif" 2>> "$LOG_FILE" && mv "$results_dir/final_data_values_epsg.tif" "$results_dir/final_data_values.tif" || true
-            fi
-            log_info "数据 GeoTIFF(数值): results/final_data_values.tif (EPSG:4326)"
-        fi
     else
         log_warn "未找到 trans.dat 且无法从 DEM 生成，跳过地理编码；仅输出雷达坐标结果。提供 topo/dem.grd 可启用 GeoTIFF 地理编码。"
     fi
@@ -1143,21 +1121,39 @@ from PIL import Image
 
 def arr_to_img(data, cmap_name, vmin, vmax, width=800):
     h, w = data.shape
-    scale = width / w
-    new_h = int(h * scale)
+    if w > width:
+        step = max(1, w // width)
+        data = data[::step, ::step]
+    
+    new_h, new_w = data.shape
+    
+    # Replace NaNs with 0 for color mapping
+    nan_mask = np.isnan(data)
+    data = np.nan_to_num(data, nan=0.0)
+    
     norm = (data - vmin) / (vmax - vmin)
     norm = np.clip(norm, 0, 1)
     
+    rgb = np.zeros((*data.shape, 3), dtype=np.uint8)
+    
     if cmap_name == 'hsv':
-        hue = norm
-        from colorsys import hsv_to_rgb
-        rgb = np.zeros((*data.shape, 3), dtype=np.uint8)
-        for i in range(data.shape[0]):
-            for j in range(data.shape[1]):
-                r, g, b = hsv_to_rgb(hue[i,j], 1.0, 1.0)
-                rgb[i,j] = [int(r*255), int(g*255), int(b*255)]
+        # Vectorized HSV to RGB
+        h_ang = norm * 6.0
+        i = np.floor(h_ang)
+        f = h_ang - i
+        # Since S=1, V=1: p=0, q=1-f, t=f
+        p = np.zeros_like(h_ang)
+        q = 1.0 - f
+        t = f
+        i = (i % 6).astype(int)
+        
+        c1 = (i == 0); rgb[c1, 0], rgb[c1, 1], rgb[c1, 2] = 255, (t[c1]*255).astype(np.uint8), 0
+        c2 = (i == 1); rgb[c2, 0], rgb[c2, 1], rgb[c2, 2] = (q[c2]*255).astype(np.uint8), 255, 0
+        c3 = (i == 2); rgb[c3, 0], rgb[c3, 1], rgb[c3, 2] = 0, 255, (t[c3]*255).astype(np.uint8)
+        c4 = (i == 3); rgb[c4, 0], rgb[c4, 1], rgb[c4, 2] = 0, (q[c4]*255).astype(np.uint8), 255
+        c5 = (i == 4); rgb[c5, 0], rgb[c5, 1], rgb[c5, 2] = (t[c5]*255).astype(np.uint8), 0, 255
+        c6 = (i == 5); rgb[c6, 0], rgb[c6, 1], rgb[c6, 2] = 255, 0, (q[c6]*255).astype(np.uint8)
     elif cmap_name == 'RdBu_r':
-        rgb = np.zeros((*data.shape, 3), dtype=np.uint8)
         rgb[:,:,0] = np.clip((norm * 2 * 255), 0, 255).astype(np.uint8)
         rgb[:,:,1] = np.clip((1 - np.abs(norm*2 - 1)) * 255, 0, 255).astype(np.uint8)
         rgb[:,:,2] = np.clip(((1-norm) * 2 * 255), 0, 255).astype(np.uint8)
@@ -1165,8 +1161,10 @@ def arr_to_img(data, cmap_name, vmin, vmax, width=800):
         val = (norm * 255).astype(np.uint8)
         rgb = np.stack([val, val, val], axis=-1)
         
+    # Paint NaNs as dark grey
+    rgb[nan_mask] = [50, 50, 50]
+        
     img = Image.fromarray(rgb)
-    img = img.resize((width, new_h), Image.NEAREST)
     return img
 
 try:
