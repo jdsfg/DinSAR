@@ -22,7 +22,8 @@ endif
 
 cd $1
 
-set line = $1
+# 干涉对名取目录的最后一级 (调用方可能传入绝对路径)
+set line = `basename $1`
 #set gacos_path = /media/student/ElementsZhao/Sentinel_ShanXi/GACOS_p113 # GACOS file (*.ztd, *.rsc) path
 set gacos_path = $2
 set wavelength = `ls *PRM | head -1 | grep radar_wavelength | awk '{print $3}'` # radar wavelength in meter
@@ -82,12 +83,22 @@ set PI = 3.141592653589793
 set scale = -JX6c
 
   echo "Processing interferogram: $line"
-  set myear = `echo $line | cut -c 1-4`
-  set mday = `echo $line | cut -c 5-7`
-  set masterdate = `date -d ""$mday" days "$myear"-01-01" +"%Y%m%d"`
-  set syear = `echo $line | cut -c 9-12`
-  set sday = `echo $line | cut -c 13-15`
-  set slavedate = `date -d ""$sday" days "$syear"-01-01" +"%Y%m%d"`
+  if ( "$line" =~ [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9] ) then
+    # run_dinsar.sh 的目录名: YYYYMMDD_YYYYMMDD
+    set masterdate = `echo $line | cut -c 1-8`
+    set slavedate = `echo $line | cut -c 10-17`
+  else if ( "$line" =~ [0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9] ) then
+    # GMTSAR 标准目录名: YYYYDDD_YYYYDDD, DDD 为从 1 开始的年积日 (故 date 偏移取 DDD-1)
+    set myear = `echo $line | cut -c 1-4`
+    set mday = `echo $line | cut -c 5-7 | awk '{print $1-1}'`
+    set masterdate = `date -d "$mday days $myear-01-01" +"%Y%m%d"`
+    set syear = `echo $line | cut -c 9-12`
+    set sday = `echo $line | cut -c 13-15 | awk '{print $1-1}'`
+    set slavedate = `date -d "$sday days $syear-01-01" +"%Y%m%d"`
+  else
+    echo "ERROR: cannot parse dates from interferogram directory name '$line' (expect YYYYMMDD_YYYYMMDD or YYYYDDD_YYYYDDD)"
+    exit 1
+  endif
   set intf = $line
 
   # set master ztd and slave ztd

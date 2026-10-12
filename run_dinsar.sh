@@ -1027,6 +1027,21 @@ run_unwrap() {
     log_info "相位解缠完成"
 }
 
+find_atm_script() {
+    local name="$1"
+    local p="$SCRIPT_DIR/gmtsar-master/gmtsar/csh/$name"
+    if [ -f "$p" ]; then
+        echo "$p"
+        return 0
+    fi
+    p="$(command -v "$name" 2>/dev/null)"
+    if [ -n "$p" ] && [ -f "$p" ]; then
+        echo "$p"
+        return 0
+    fi
+    return 1
+}
+
 run_atm_correction() {
     log_step "[5.5/8] 大气校正 (${ATM_MODE})..."
     
@@ -1039,6 +1054,12 @@ run_atm_correction() {
     
     if [ ! -f unwrap.grd ]; then
         log_warn "未找到解缠结果，跳过大气校正"
+        return 0
+    fi
+
+    # 断点续跑时 unwrap.grd 已是校正后的结果，重复校正会叠加并覆盖 unwrap_pre_atm.grd 中的原始解缠
+    if [ -f unwrap_pre_atm.grd ]; then
+        log_info "已存在 unwrap_pre_atm.grd, 跳过大气校正 (Checkpoint; 更换模式请先还原 unwrap.grd 并删除该文件)"
         return 0
     fi
     
@@ -1065,8 +1086,9 @@ run_atm_correction() {
         fi
 
         log_info "执行 Re_atm.csh 进行经验校正..."
-        if [ -f "$SCRIPT_DIR/gmtsar-master/gmtsar/csh/Re_atm.csh" ]; then
-            csh -f "$SCRIPT_DIR/gmtsar-master/gmtsar/csh/Re_atm.csh" unwrap.grd dem_ra.grd unwrap_atm.grd >> "$LOG_FILE" 2>&1
+        local re_atm_script
+        if re_atm_script="$(find_atm_script Re_atm.csh)"; then
+            csh -f "$re_atm_script" unwrap.grd dem_ra.grd unwrap_atm.grd >> "$LOG_FILE" 2>&1
         else
             log_warn "未找到 Re_atm.csh，跳过大气校正"
             return 0
@@ -1095,9 +1117,9 @@ run_atm_correction() {
         fi
 
         log_info "执行 make_gacos_correction.csh..."
-        local gacos_script="$SCRIPT_DIR/gmtsar-master/gmtsar/csh/make_gacos_correction.csh"
-        if [ ! -f "$gacos_script" ]; then
-            log_error "未找到 GACOS 脚本: $gacos_script"
+        local gacos_script
+        if ! gacos_script="$(find_atm_script make_gacos_correction.csh)"; then
+            log_error "未找到 GACOS 脚本: make_gacos_correction.csh"
             return 1
         fi
         
@@ -1115,16 +1137,12 @@ run_atm_correction() {
     # [模式 C] 时空滤波 (ST_FILTER)
     elif [ "$ATM_MODE" = "ST_FILTER" ]; then
         log_info "执行 ST_Filter.csh 进行时空/空间自适应滤波..."
-        local st_script="$SCRIPT_DIR/gmtsar-master/gmtsar/csh/ST_Filter.csh"
-        if [ ! -f "$st_script" ]; then
-            st_script="ST_Filter.csh"
-        fi
-        
-        if ! command -v "$st_script" &>/dev/null && [ ! -f "$st_script" ]; then
+        local st_script
+        if st_script="$(find_atm_script ST_Filter.csh)"; then
+            csh -f "$st_script" unwrap.grd unwrap_atm.grd "$PROJECT_DIR" >> "$LOG_FILE" 2>&1
+        else
             log_warn "未找到 ST_Filter.csh，跳过滤波"
             cp unwrap.grd unwrap_atm.grd
-        else
-            csh -f "$st_script" unwrap.grd unwrap_atm.grd "$PROJECT_DIR" >> "$LOG_FILE" 2>&1
         fi
     fi
 
