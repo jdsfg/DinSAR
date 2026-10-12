@@ -1,16 +1,16 @@
 #!/bin/bash
 #=============================================================================
-# PowerChina-1 DInSAR 数据处理脚本 v2.1
+# PowerChina-1 DInSAR 数据处理脚本 v2.5
 #
-# 支持: DJ1 (电建一号), BC3 (涪城一号/天仪) X波段 SAR 数据
+# 支持: DJ1 (电建一号, X波段), BC3 (涪城一号/天仪, C波段), LT1 (陆探一号, L波段)
 # 
 # 用法:
 #   ./run_dinsar.sh                           # 交互式向导
 #   ./run_dinsar.sh /path/to/project          # 指定项目目录
-#   ./run_dinsar.sh --auto --mode A /path     # 全自动处理
+#   ./run_dinsar.sh --auto --mode fast /path  # 全自动处理
 #
 # 作者: PowerChina-1 DInSAR Team
-# 日期: 2026-01-28
+# 日期: 2026-01-28 (v2.5: 2026-10 并入 LT1 分支)
 #=============================================================================
 
 set -o pipefail
@@ -18,8 +18,30 @@ set -o pipefail
 #-----------------------------------------------------------------------------
 # 全局变量
 #-----------------------------------------------------------------------------
-SCRIPT_VERSION="2.1"
+SCRIPT_VERSION="2.5"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+#-----------------------------------------------------------------------------
+# 环境配置：把 GMTSAR 目录追加到 PATH 末尾，仅作兜底。
+# 已在 PATH 中的命令（如 ~/.bashrc 配置的安装目录）优先，不会被源码目录里的同名程序覆盖。
+#-----------------------------------------------------------------------------
+_add_path_if_dir() {
+    local d="$1"
+    [ -d "$d" ] || return 0
+    case ":$PATH:" in
+        *":$d:"*) ;;
+        *) PATH="$PATH:$d" ;;
+    esac
+}
+for _root in "$HOME/gmtsar/gmtsar-master" "$SCRIPT_DIR/gmtsar-master"; do
+    _add_path_if_dir "$_root/bin"
+    _add_path_if_dir "$_root/gmtsar"
+    _add_path_if_dir "$_root/preproc/DJ1_preproc/src_swath"
+    _add_path_if_dir "$_root/preproc/LT1_preproc/src"
+    _add_path_if_dir "$_root/preproc/LT1_preproc/src_orbit"
+done
+unset _root
+export PATH
 
 # 处理参数
 PROJECT_DIR=""
@@ -97,10 +119,13 @@ PowerChina-1 DInSAR 数据处理脚本 v${SCRIPT_VERSION}
     --mode fast|standard|quality
                                         全流程模式: Fast(默认) / Standard / Quality
                                         兼容旧写法: A=Fast, B=Quality
-    --atm none|empirical|gacos
-                                        大气校正模式: None / Empirical (默认) / GACOS
-    --gacos-path <path>  指定 GACOS 数据目录
+    --atm none|empirical|gacos|st_filter
+                                        大气校正模式: None (默认) / Empirical / GACOS / ST_Filter
+    --gacos-path <path>  指定 GACOS 数据目录 (--atm gacos 时必需)
+  --crop             仅处理影像中心 50%x50% 区域 (加速验证用)
   --help             显示此帮助
+
+支持卫星 (从 XML 自动识别): DJ1 / BC3 / LT1 (LT1 自动启用 PRF·DC 归一化与 L 波段配准参数)
 
 全流程模式:
     Fast (默认):     优先时效性，缩小搜索窗与控制点密度
@@ -255,8 +280,8 @@ check_system() {
         DOWNSAMPLE_FACTOR=4
     fi
     
-    # 检查必要命令
-    local required_cmds=("gmt" "make_slc_dj1" "xcorr" "phasediff" "snaphu")
+    # 检查必要命令（SLC 预处理器 make_slc_* 因卫星而异，在 generate_single_slc 中按需检查）
+    local required_cmds=("gmt" "xcorr" "phasediff" "snaphu" "resamp")
     local missing=()
     
     for cmd in "${required_cmds[@]}"; do
@@ -278,6 +303,55 @@ check_system() {
 #-----------------------------------------------------------------------------
 # 数据发现模块 (Filename Agnostic)
 #-----------------------------------------------------------------------------
+normalize_satellite_type() {
+    local value
+    value=$(echo "$1" | tr '[:lower:]' '[:upper:]')
+    case "$value" in
+        *LT1*|*LUTAN*|*LU_TAN*|*陆探*) echo "LT1" ;;
+        *DJ1*|*POWERCHINA*) echo "DJ1" ;;
+        *BC3*|*FC1*|*FUCHENG*|*SPACETY*|*TIANYI*) echo "BC3" ;;
+        *) echo "BC3" ;;
+    esac
+}
+
+# 兼容 LT1 的 xxx.meta.xml -> xxx.tiff 命名
+find_matching_tiff() {
+    local raw_dir="$1"
+    local stem="$2"
+    local candidate ext short_stem
+    for ext in tiff TIFF tif TIF; do
+        candidate="$raw_dir/${stem}.${ext}"
+        [ -f "$candidate" ] && { echo "$candidate"; return 0; }
+    done
+    short_stem="${stem%.meta}"
+    if [ "$short_stem" != "$stem" ]; then
+        for ext in tiff TIFF tif TIF; do
+            candidate="$raw_dir/${short_stem}.${ext}"
+            [ -f "$candidate" ] && { echo "$candidate"; return 0; }
+        done
+    fi
+    candidate=$(find "$raw_dir" -maxdepth 1 -type f \( -iname "${stem}*.tif" -o -iname "${stem}*.tiff" -o -iname "${short_stem}*.tif" -o -iname "${short_stem}*.tiff" \) | sort | head -1)
+    [ -n "$candidate" ] && echo "$candidate"
+    return 0
+}
+
+extract_acquisition_date() {
+    local xml="$1"
+    local acq_date
+    acq_date=$(grep -ioP '(?<=<startTime>|<AcquisitionDate>|<SceneDate>|<CenterTime>|<timeUTC>)[0-9TZ:.\-]+' "$xml" 2>/dev/null | head -1)
+    [ -z "$acq_date" ] && acq_date=$(grep -oP '\d{4}-\d{2}-\d{2}' "$xml" 2>/dev/null | head -1)
+    [ -z "$acq_date" ] && acq_date=$(basename "$xml" | grep -oP '(?<!\d)(19|20)\d{6}(?!\d)' | head -1)
+    echo "$acq_date" | tr -d 'TZ:.-' | cut -c1-8
+}
+
+detect_satellite_type() {
+    local xml="$1"
+    local sat_id
+    sat_id=$(grep -ioP '(?<=<SatelliteID>|<SensorID>|<Satellite>|<mission>|<missionInfo>)[^<]+' "$xml" 2>/dev/null | head -1)
+    [ -z "$sat_id" ] && sat_id=$(basename "$xml")
+    normalize_satellite_type "$sat_id"
+}
+
 discover_data() {
     log_step "扫描数据目录..."
     
@@ -309,14 +383,8 @@ discover_data() {
         local basename=$(basename "$xml")
         local stem="${basename%.*}"
         
-        # 尝试各种 TIFF 扩展名
-        local tiff=""
-        for ext in tiff TIFF tif TIF; do
-            if [ -f "$raw_dir/${stem}.${ext}" ]; then
-                tiff="$raw_dir/${stem}.${ext}"
-                break
-            fi
-        done
+        local tiff
+        tiff=$(find_matching_tiff "$raw_dir" "$stem")
         
         if [ -z "$tiff" ]; then
             log_warn "孤立 XML (无匹配 TIFF): $basename"
@@ -326,19 +394,8 @@ discover_data() {
         # 从 XML 内部解析元数据 (不依赖文件名)
         local acq_date=""
         local sat_id=""
-        
-        # 尝试多种日期标签格式
-        acq_date=$(grep -ioP '(?<=<startTime>|<AcquisitionDate>|<SceneDate>|<CenterTime>)[0-9TZ:\-]+' "$xml" 2>/dev/null | head -1)
-        if [ -z "$acq_date" ]; then
-            acq_date=$(grep -oP '\d{4}-\d{2}-\d{2}' "$xml" 2>/dev/null | head -1)
-        fi
-        
-        # 标准化日期 YYYYMMDD
-        acq_date=$(echo "$acq_date" | tr -d 'TZ:-' | cut -c1-8)
-        
-        # 卫星ID
-        sat_id=$(grep -ioP '(?<=<SatelliteID>|<SensorID>|<Satellite>)[^<]+' "$xml" 2>/dev/null | head -1)
-        [ -z "$sat_id" ] && sat_id="BC3"
+        acq_date=$(extract_acquisition_date "$xml")
+        sat_id=$(detect_satellite_type "$xml")
         
         if [ -n "$acq_date" ]; then
             data_pairs["$acq_date"]="$xml|$tiff|$sat_id"
@@ -417,31 +474,51 @@ generate_trans_dat() {
     return 1
 }
 
+generate_single_slc() {
+    local role="$1"
+    local xml="$2"
+    local tiff="$3"
+    local out_stem="$4"
+    local processor
+
+    case "$SATELLITE_TYPE" in
+        LT1) processor="make_slc_lt1" ;;
+        *)   processor="make_slc_dj1" ;;
+    esac
+
+    command -v "$processor" &>/dev/null || error_exit "未找到 $processor，请先编译/安装对应预处理器"
+
+    log_info "生成${role} SLC ($out_stem, $SATELLITE_TYPE, $processor)..."
+    if [ "$processor" = "make_slc_lt1" ]; then
+        # 第 4 个参数为 SLC 幅度缩放因子
+        "$processor" "$xml" "$tiff" "$out_stem" 10.0 >> "$LOG_FILE" 2>&1 || error_exit "${role} SLC 生成失败"
+    elif ! "$processor" "$xml" "$tiff" "$out_stem" >> "$LOG_FILE" 2>&1; then
+        log_warn "$processor 失败，尝试 make_slc_s1a..."
+        make_slc_s1a "$xml" "$tiff" "$out_stem" >> "$LOG_FILE" 2>&1 || error_exit "${role} SLC 生成失败"
+    fi
+}
+
 generate_slc() {
     log_step "[1/8] 生成 SLC..."
     
     cd "$PROJECT_DIR/SLC" || error_exit "无法进入 SLC 目录"
     
-    # 生成主影像 SLC
-    log_info "生成主影像 SLC ($MASTER_DATE)..."
-    if ! make_slc_dj1 "$MASTER_XML" "$MASTER_TIFF" "$MASTER_DATE" >> "$LOG_FILE" 2>&1; then
-        log_warn "make_slc_dj1 失败，尝试 make_slc_s1a..."
-        make_slc_s1a "$MASTER_XML" "$MASTER_TIFF" "$MASTER_DATE" >> "$LOG_FILE" 2>&1 || error_exit "主影像 SLC 生成失败"
-    fi
-    
-    # 生成辅影像 SLC
-    log_info "生成辅影像 SLC ($SLAVE_DATE)..."
-    if ! make_slc_dj1 "$SLAVE_XML" "$SLAVE_TIFF" "$SLAVE_DATE" >> "$LOG_FILE" 2>&1; then
-        log_warn "make_slc_dj1 失败，尝试 make_slc_s1a..."
-        make_slc_s1a "$SLAVE_XML" "$SLAVE_TIFF" "$SLAVE_DATE" >> "$LOG_FILE" 2>&1 || error_exit "辅影像 SLC 生成失败"
-    fi
+    generate_single_slc "主影像" "$MASTER_XML" "$MASTER_TIFF" "$MASTER_DATE"
+    generate_single_slc "辅影像" "$SLAVE_XML" "$SLAVE_TIFF" "$SLAVE_DATE"
     
     # 核心修复: 自动修复 PRM 文件参数 (earth_radius, SC_vel, SC_height, tie_point)
-    if [ -f "$PROJECT_DIR/SLC/fix_prm.py" ]; then
-        log_info "修复主影像 PRM 文件参数..."
-        python3 "$PROJECT_DIR/SLC/fix_prm.py" "${MASTER_DATE}.PRM" "$MASTER_XML" "${MASTER_DATE}.LED" >> "$LOG_FILE" 2>&1
+    # fix_prm.py 依赖天仪/电建 XML 结构，LT1 不适用。优先用项目 SLC 目录里的副本，其次用脚本同目录的。
+    local fix_prm_py=""
+    if [ "$SATELLITE_TYPE" != "LT1" ]; then
+        for c in "$PROJECT_DIR/SLC/fix_prm.py" "$SCRIPT_DIR/fix_prm.py"; do
+            [ -f "$c" ] && { fix_prm_py="$c"; break; }
+        done
+    fi
+    if [ -n "$fix_prm_py" ]; then
+        log_info "修复主影像 PRM 文件参数 ($fix_prm_py)..."
+        python3 "$fix_prm_py" "${MASTER_DATE}.PRM" "$MASTER_XML" "${MASTER_DATE}.LED" >> "$LOG_FILE" 2>&1
         log_info "修复辅影像 PRM 文件参数..."
-        python3 "$PROJECT_DIR/SLC/fix_prm.py" "${SLAVE_DATE}.PRM" "$SLAVE_XML" "${SLAVE_DATE}.LED" >> "$LOG_FILE" 2>&1
+        python3 "$fix_prm_py" "${SLAVE_DATE}.PRM" "$SLAVE_XML" "${SLAVE_DATE}.LED" >> "$LOG_FILE" 2>&1
     fi
     
     # 动态读取雷达波长 (P0: 波长硬编码修复)
@@ -456,6 +533,90 @@ generate_slc() {
     fi
     
     log_info "SLC 生成完成"
+}
+
+#-----------------------------------------------------------------------------
+# LT1 专用预处理：PRF 归一化 + 多普勒中心频率(DC)归一化
+# LT1 两景 PRF 可相差 1% 以上，不先归一化会使方位向配准系统性失配。
+#-----------------------------------------------------------------------------
+run_lt1_preprocess() {
+    [ "$SATELLITE_TYPE" = "LT1" ] || return 0
+
+    log_step "[1.5/8] LT1 专用预处理 (PRF/DC 归一化)..."
+
+    cd "$PROJECT_DIR/SLC" || error_exit "无法进入 SLC 目录"
+
+    local master_prm="${MASTER_DATE}.PRM"
+    local slave_prm="${SLAVE_DATE}.PRM"
+    local prf_m prf_s prf_ratio
+
+    prf_m=$(awk -F= '/^PRF/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$master_prm")
+    prf_s=$(awk -F= '/^PRF/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$slave_prm")
+
+    if [ -n "$prf_m" ] && [ -n "$prf_s" ]; then
+        prf_ratio=$(awk -v m="$prf_m" -v s="$prf_s" 'BEGIN {r = (m-s)/s; if (r<0) r=-r; printf("%.6f", r)}')
+        log_info "PRF: master=$prf_m slave=$prf_s (相对差异=${prf_ratio})"
+
+        if awk -v r="$prf_ratio" 'BEGIN {exit !(r > 0.001)}'; then
+            log_info "PRF 差异 >0.1%，重采样 slave SLC 到 master PRF..."
+            cp -n "$slave_prm" "${slave_prm}.before_prf_norm"
+
+            python3 - "$prf_m" "$prf_s" "$SLAVE_DATE" >> "$LOG_FILE" 2>&1 << 'PYPRF' || error_exit "LT1 PRF 归一化失败"
+import os, re, sys
+import numpy as np
+
+prf_m, prf_s, stem = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
+prm_text = open(f"{stem}.PRM").read()
+n_rng = int(re.search(r"num_rng_bins\s*=\s*(\d+)", prm_text).group(1))
+n_samples = n_rng * 2  # int16 实/虚交织
+
+slc = np.memmap(f"{stem}.SLC", dtype=np.int16, mode="r")
+n_lines = len(slc) // n_samples
+slc = slc[: n_lines * n_samples].reshape(n_lines, n_samples)
+
+ratio = prf_s / prf_m
+new_n = int(n_lines / ratio)
+src = np.arange(new_n) * ratio
+i0 = np.clip(src.astype(np.int64), 0, n_lines - 2)
+frac = (src - i0).astype(np.float32)
+
+tmp = f"{stem}.SLC.prfnorm"
+chunk = 2048
+with open(tmp, "wb") as fo:
+    for s in range(0, new_n, chunk):
+        e = min(s + chunk, new_n)
+        a = slc[i0[s:e]].astype(np.float32)
+        b = slc[i0[s:e] + 1].astype(np.float32)
+        f = frac[s:e, None]
+        out = np.clip(np.round(a * (1 - f) + b * f), -32768, 32767).astype(np.int16)
+        fo.write(out.tobytes())
+del slc
+os.replace(tmp, f"{stem}.SLC")
+
+prm_text = re.sub(r"(PRF\s*=\s*)\S+", lambda m: m.group(1) + repr(prf_m), prm_text)
+prm_text = re.sub(r"(num_lines\s*=\s*)\S+", lambda m: m.group(1) + str(new_n), prm_text)
+open(f"{stem}.PRM", "w").write(prm_text)
+print(f"PRF normalized: {n_lines} -> {new_n} lines, PRF {prf_s} -> {prf_m}")
+PYPRF
+            log_info "PRF 归一化完成"
+        else
+            log_info "PRF 差异 <0.1%，无需归一化"
+        fi
+    fi
+
+    local fd1_m fd1_s
+    fd1_m=$(awk -F= '/^fd1/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$master_prm")
+    fd1_s=$(awk -F= '/^fd1/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$slave_prm")
+    if [ -n "$fd1_m" ] && [ -n "$fd1_s" ]; then
+        log_info "DC 归一化: slave fd1=$fd1_s -> master fd1=$fd1_m"
+        if command -v update_PRM &>/dev/null; then
+            update_PRM "$slave_prm" fd1 "$fd1_m" >> "$LOG_FILE" 2>&1
+        else
+            sed -i "s/^fd1.*/fd1 = $fd1_m/" "$slave_prm"
+        fi
+    fi
+
+    log_info "LT1 预处理完成"
 }
 
 run_alignment() {
@@ -499,6 +660,29 @@ run_alignment() {
             threshold_snr=20
             ;;
     esac
+
+    # LT1 专用：L 波段偏移量大，先按 near_range 差估计粗距离向偏移作为搜索中心，再用大窗口 xcorr。
+    # 符号：rshift = (nr_master - nr_slave) / 距离向像元间距（与 FFT 互相关输出方向相反，见 迭代.md 10b）
+    if [ "$SATELLITE_TYPE" = "LT1" ]; then
+        local nr_m nr_s rsr coarse_rshift
+        nr_m=$(awk -F= '/near_range/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$master_prm")
+        nr_s=$(awk -F= '/near_range/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$slave_prm")
+        rsr=$(awk -F= '/rng_samp_rate/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$master_prm")
+        if [ -n "$nr_m" ] && [ -n "$nr_s" ] && [ -n "$rsr" ]; then
+            coarse_rshift=$(awk -v nm="$nr_m" -v ns="$nr_s" -v rs="$rsr" \
+                'BEGIN {c=299792458.0; pix=c/(2*rs); printf("%d", (nm-ns)/pix)}')
+            log_info "LT1 粗距离向偏移 rshift=$coarse_rshift (nr_m=$nr_m, nr_s=$nr_s)"
+            command -v update_PRM &>/dev/null && update_PRM "$slave_prm" rshift "$coarse_rshift" >> "$LOG_FILE" 2>&1
+        else
+            log_warn "LT1: 无法读取 near_range/rng_samp_rate，跳过粗偏移估计"
+        fi
+        xsearch=512
+        ysearch=512
+        nx_corr=30
+        ny_corr=30
+        threshold_snr=20
+        log_info "LT1: 使用 L 波段配准参数 (xsearch=$xsearch ysearch=$ysearch nx=$nx_corr ny=$ny_corr)"
+    fi
 
     log_info "运行 xcorr（${PROCESS_MODE}）..."
     xcorr "$master_prm" "$slave_prm" -xsearch "$xsearch" -ysearch "$ysearch" -nx "$nx_corr" -ny "$ny_corr" >> "$LOG_FILE" 2>&1
@@ -872,7 +1056,7 @@ run_atm_correction() {
         # 生成雷达坐标 DEM (dem_ra.grd) - 使用快速算法
         if [ ! -f dem_ra.grd ]; then
             log_info "正在生成雷达坐标 DEM (dem_ra.grd) [快速算法]..."
-            bash /home/mihu/gmtsar/DInSAR_v2.3_Delivery/fast_dem2topo_ra.sh "${MASTER_DATE}.PRM" "$dem_grd" "$LOG_FILE"
+            bash "$SCRIPT_DIR/fast_dem2topo_ra.sh" "${MASTER_DATE}.PRM" "$dem_grd" "$LOG_FILE"
         fi
         
         if [ ! -f dem_ra.grd ]; then
@@ -969,6 +1153,11 @@ run_detrend() {
     fi
     
     # 关键: 在相位域进行去倾斜 (物理正确)
+    # LT1 (L 波段, 导师反馈): 使用 N5 曲面，其余卫星沿用 DETREND_ORDER
+    if [ "$SATELLITE_TYPE" = "LT1" ]; then
+        DETREND_ORDER=5
+        log_info "LT1: 使用 N5 曲面去趋势"
+    fi
     log_info "拟合轨道残余趋势面 (N=$DETREND_ORDER)..."
     
     gmt grdtrend unwrap.grd -N${DETREND_ORDER}r \
@@ -1019,7 +1208,7 @@ run_displacement() {
     
     # 记录处理参数 (可追溯性)
     cat >> "$PROJECT_DIR/debug/processing_params.txt" << EOF
-Processing Parameters (v2.1)
+Processing Parameters (v${SCRIPT_VERSION})
 ============================
 Date: $(date)
 Master: $MASTER_DATE
@@ -1213,7 +1402,7 @@ main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
     echo "║  PowerChina-1 DInSAR 数据处理脚本 v${SCRIPT_VERSION}                ║"
-    echo "║  支持: DJ1 (电建一号) / BC3 (涪城一号)                      ║"
+    echo "║  支持: DJ1 (电建一号) / BC3 (涪城一号) / LT1 (陆探一号)     ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
     
@@ -1259,6 +1448,7 @@ main() {
     
     # 执行处理流程
     generate_slc || exit 1
+    run_lt1_preprocess || exit 1
     run_alignment || exit 1
     run_interferogram || exit 1
     run_filter || exit 1
