@@ -60,6 +60,8 @@ WAVELENGTH=""  # 将从 PRM 文件自动读取
 PROCESS_MODE="FAST"  # FAST/ STANDARD/ QUALITY
 UNWRAP_MODE="A"      # A=稳定模式, B=高精度模式（由 PROCESS_MODE 映射）
 ATM_MODE="NONE" # P1-6: 默认关闭全局线性大气校正，防止引入新误差
+COREG_MODE="legacy"  # legacy=xcorr+fitoffset (默认); multiscale=多尺度配准 ms_register.py (须显式 --coreg multiscale)
+MS_REGISTER_ARGS="${MS_REGISTER_ARGS:-}"  # 额外传给 ms_register.py register 的参数 (高级用法, 如 "--scales 512,256,128")
 GACOS_PATH=""        # GACOS 数据目录 (.ztd + .rsc)
 REF_PX=""            # 参考点 Range 坐标 (可选，GACOS 模式使用)
 REF_PY=""            # 参考点 Azimuth 坐标 (可选，GACOS 模式使用)
@@ -122,6 +124,11 @@ PowerChina-1 DInSAR 数据处理脚本 v${SCRIPT_VERSION}
     --atm none|empirical|gacos|st_filter
                                         大气校正模式: None (默认) / Empirical / GACOS / ST_Filter
     --gacos-path <path>  指定 GACOS 数据目录 (--atm gacos 时必需)
+    --coreg legacy|multiscale
+                                        配准方式: legacy (默认, xcorr + fitoffset) /
+                                        multiscale (多尺度配准 ms_register.py: 不依赖 PRM 里的初始偏移,
+                                        配准后用独立点位复核, 未通过则中止, 不会静默退回 legacy)
+                                        额外参数用环境变量 MS_REGISTER_ARGS 传给 ms_register.py register
   --crop             仅处理影像中心 50%x50% 区域 (加速验证用)
   --help             显示此帮助
 
@@ -199,6 +206,14 @@ parse_args() {
                 ;;
             --gacos-path)
                 GACOS_PATH="$2"
+                shift 2
+                ;;
+            --coreg)
+                case "${2,,}" in
+                    legacy|xcorr) COREG_MODE="legacy" ;;
+                    multiscale|ms) COREG_MODE="multiscale" ;;
+                    *) error_exit "无效 --coreg: $2 (legacy|multiscale)" ;;
+                esac
                 shift 2
                 ;;
             --help|-h)
@@ -619,6 +634,49 @@ PYPRF
     log_info "LT1 预处理完成"
 }
 
+#-----------------------------------------------------------------------------
+# 多尺度配准 (--coreg multiscale): 估计 -> resamp 重采样 -> 独立点位复核 一步完成。
+# 输出文件名与 legacy 流程相同 (${SLAVE_DATE}RS.PRM / RS.SLC), 下游步骤不必区分; 未通过复核时直接中止,
+# 不退回 legacy, 避免把没通过质量门限的配准结果悄悄交给后面的步骤。
+#-----------------------------------------------------------------------------
+find_ms_register() {
+    local c
+    if c=$(command -v ms_register.py 2>/dev/null); then
+        echo "$c"
+        return 0
+    fi
+    for c in "$SCRIPT_DIR/gmtsar-master/gmtsar/csh/ms_register.py" "$HOME/gmtsar/gmtsar-master/gmtsar/csh/ms_register.py"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+run_alignment_multiscale() {
+    local master_prm="$1"
+    local slave_prm="$2"
+    local slave_rs_prm="${SLAVE_DATE}RS.PRM"
+    local slave_rs_slc="${SLAVE_DATE}RS.SLC"
+    local ms_register rc
+
+    ms_register=$(find_ms_register) || error_exit "未找到 ms_register.py (应在 gmtsar-master/gmtsar/csh/ 下)"
+    command -v python3 &>/dev/null || error_exit "多尺度配准需要 python3 (含 numpy)"
+
+    log_info "运行多尺度配准 (ms_register.py register)..."
+    # --prm-slc-file: resamp 输出的 PRM 沿用从影像原来的 SLC_file, run_interferogram 会把 RS.SLC 链接成这个名字。
+    # MS_REGISTER_ARGS 故意不加引号, 以便传入多个参数。
+    # shellcheck disable=SC2086
+    python3 "$ms_register" register "$master_prm" "$slave_prm" \
+        --out-slc "$slave_rs_slc" --out-prm "$slave_rs_prm" --prm-slc-file "${SLAVE_DATE}.SLC" \
+        --est-prm "${SLAVE_DATE}_est.PRM" \
+        --report coreg_report.json --log coreg_offsets.log --points coreg_points.dat \
+        $MS_REGISTER_ARGS >> "$LOG_FILE" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] || [ ! -f "$slave_rs_prm" ] || [ ! -f "$slave_rs_slc" ]; then
+        error_exit "多尺度配准未通过 (退出码 $rc), 详见 $PROJECT_DIR/SLC/coreg_report.json 和日志; 不会自动退回 legacy 配准"
+    fi
+    log_info "多尺度配准完成: $slave_rs_prm (报告: SLC/coreg_report.json)"
+}
+
 run_alignment() {
     log_step "[2/8] 影像配准..."
     
@@ -629,6 +687,12 @@ run_alignment() {
     
     if [ ! -f "$master_prm" ] || [ ! -f "$slave_prm" ]; then
         error_exit "PRM 文件不存在"
+    fi
+
+    if [ "$COREG_MODE" = "multiscale" ]; then
+        run_alignment_multiscale "$master_prm" "$slave_prm"
+        log_info "配准完成"
+        return 0
     fi
     
     local xsearch=128
@@ -1235,6 +1299,7 @@ Satellite: $SATELLITE_TYPE
 Wavelength: $WAVELENGTH m
 Detrend Order: $DETREND_ORDER
 Process Mode: $PROCESS_MODE
+Coregistration: $COREG_MODE
 Unwrap Mode: $UNWRAP_MODE
 Downsample: ${DOWNSAMPLE_FACTOR}x
 Displacement Range: $disp_min ~ $disp_max mm
@@ -1436,6 +1501,7 @@ main() {
     
     log_info "项目目录: $PROJECT_DIR"
     log_info "处理模式: $PROCESS_MODE"
+    log_info "配准方式: $COREG_MODE"
     log_info "解缠模式: $UNWRAP_MODE"
     log_info "降采样: ${DOWNSAMPLE_FACTOR}x"
     
@@ -1491,5 +1557,7 @@ main() {
     echo ""
 }
 
-# 运行主函数
-main "$@"
+# 运行主函数 (被 source 时只加载函数, 便于单元测试)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
