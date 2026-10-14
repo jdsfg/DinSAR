@@ -8,6 +8,15 @@
 - **APS 大气相位校正系统:** 支持三种修正模式 (`--atm <none|empirical|gacos|st_filter>`) 以减少大气引起的相位延迟。
 - **高稳健性:** 支持 snaphu OOM 自动分块重试和意外中断解缠恢复，具备生成 ArcGIS 兼容的 GeoTIFF 及自动地理编码能力。
 
+## 新版电建一号数据 (XML + HDF5) 与多尺度配准
+新版产品的 XML 结构和 SLC 格式（h5 单精度复数）与旧版不同，旧的 `make_slc_dj1` 不能处理。相关工具（都带单元测试）：
+- `gmtsar-master/preproc/DJ1_preproc/src_swath/dj1_pair_select.py ROOT [--json pairs.json]`：只读 XML 的像对筛选。
+- `make_slc_dj1h5.py PRODUCT.XML PRODUCT.h5 20260904`（需要 numpy 和 h5py）：转成 GMTSAR 的 `.SLC/.PRM/.LED`，并写转换说明 `.convert.txt`。实时轨道只覆盖成像时段，转换时会外推到场景前后；PRM 的 `fd1` 固定为 0（零多普勒产品，非零值会让 `SAT_llt2rat` 的方位坐标错开上千行）。PRM 里没有 `SC_vel/earth_radius/SC_height`，按 GMTSAR 惯例用 `calc_dop_orb` 追加（从影像沿用主影像的 `earth_radius`）。
+- `gmtsar-master/gmtsar/csh/ms_register.py register M.PRM S.PRM ...`：多尺度配准（不依赖 PRM 里的初始偏移；估计、`resamp` 重采样、独立点位复核一步完成，未通过复核时返回非 0 且不留下半成品）。
+- `run_dinsar.sh --coreg multiscale`：在流水线里启用多尺度配准，默认 `legacy`（`xcorr + fitoffset`，行为不变）。复核未通过会直接中止，不会悄悄退回 legacy。
+
+目前 `run_dinsar.sh` 的"生成 SLC"步骤仍只认旧版 XML + TIFF 产品；新版 HDF5 产品需要先用上面的工具转换，再从对齐步骤起使用流水线函数。测试：`python3 -m unittest discover -s tests`（共 55 项，约 6 分钟，大头是配准的合成数据测试）。缺少 h5py、scipy，或 GMTSAR 的 `resamp`、`calc_dop_orb`、`SAT_llt2rat` 时，对应的测试会被跳过；跳过不等于通过，请看输出里的 `skipped`。
+
 ## 目录结构说明
 - `gmtsar-master/`: 定制版 GMTSAR C 源码及 CSH 核心处理脚本。（需编译使用）
 - `deploy/`: 系统离线与在线安装所需的打包方案及一键部署脚本。
