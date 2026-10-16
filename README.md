@@ -25,6 +25,26 @@
 
 测试：`python3 -m unittest discover -s tests`（共 90 项，约 6 分钟，大头是配准的合成数据测试）。缺少 h5py、scipy，或 GMTSAR 的 `resamp`、`calc_dop_orb`、`SAT_llt2rat` 时，对应的测试会被跳过；跳过不等于通过，请看输出里的 `skipped`。
 
+## Ray-traced atmospheric correction
+
+For `run_dinsar.sh --atm raytrace`, provide normalized `master_weather.nc` and
+`slave_weather.nc` cubes in the configured weather directory, `stage/weather`,
+`stage`, or `project/weather`. Each cube's `epoch_utc` must be within 30 minutes
+of its PRM acquisition time. Alternatively, place an `*era5*raw*.npz` archive
+in one of those locations; the workflow builds the two cubes from the PRM epochs
+and the geographic DEM bounds expanded by 0.75 degrees.
+
+Fetch the hourly ARCO-ERA5 inputs with:
+
+```sh
+python3 gmtsar-master/gmtsar/csh/era5_weather.py fetch --bbox 108/109/40/41 \
+  --epoch 2026-09-04T04:23:44Z --epoch 2026-09-12T04:23:44Z --out era5_raw.npz
+```
+
+ERA5 dates in 2026 are ERA5T preliminary data. The workflow's physical phase
+correction subtracts the plane-removed atmospheric phase; its `--scale` option
+defaults to `1.0`.
+
 ## 目录结构说明
 - `gmtsar-master/`: 定制版 GMTSAR C 源码及 CSH 核心处理脚本。（需编译使用）
 - `deploy/`: 系统离线与在线安装所需的打包方案及一键部署脚本。

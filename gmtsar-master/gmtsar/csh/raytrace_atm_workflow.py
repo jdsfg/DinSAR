@@ -20,9 +20,13 @@ import math
 import shutil
 import argparse
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import numpy as np
-from osgeo import gdal, osr
+from osgeo import gdal
+from scipy import ndimage
+from scipy.interpolate import RegularGridInterpolator
+from scipy.io import netcdf_file
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GMTSAR Physical Atmospheric Ray-Tracing Workflow")
@@ -31,6 +35,7 @@ def parse_args():
     parser.add_argument("--project-dir", required=True, help="Root project directory")
     parser.add_argument("--stage-dir", required=True, help="Stage execution directory")
     parser.add_argument("--weather-dir", default="", help="Optional weather directory containing .nc cubes")
+    parser.add_argument("--scale", type=float, default=1.0, help="Atmospheric phase correction scale")
     return parser.parse_args()
 
 def locate_raytrace_bin():
@@ -88,7 +93,6 @@ def locate_weather_cubes(stage_dir, project_dir, weather_dir):
         Path(stage_dir) / "weather",
         Path(stage_dir),
         Path(project_dir) / "weather",
-        Path("/home/mihu/.gemini/antigravity-cli/brain/b7e5878e-56ae-4d39-ae08-f151da5e8456/scratch/atm")
     ])
 
     m_nc = None
@@ -105,6 +109,203 @@ def locate_weather_cubes(stage_dir, project_dir, weather_dir):
 
     return m_nc, s_nc
 
+
+def prm_epoch_utc(prm_path):
+    clock = None
+    with open(prm_path) as prm:
+        for line in prm:
+            if line.strip().startswith("SC_clock_start"):
+                clock = line.split("=", 1)[1].strip().split()[0]
+                break
+    if clock is None:
+        raise ValueError(f"SC_clock_start not found in PRM: {prm_path}")
+    try:
+        year_text, day_text = clock.split(".", 1)
+        year, day = int(year_text[:4]), int(year_text[4:])
+        fraction = float("0." + day_text)
+        start = datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=day - 1)
+        return start + timedelta(seconds=fraction * 86400.0)
+    except (ValueError, OverflowError) as error:
+        raise ValueError(f"Invalid SC_clock_start in {prm_path}: {clock}") from error
+
+
+def validate_cube_epoch(cube_path, expected_epoch, tolerance_seconds=1800):
+    with netcdf_file(str(cube_path), "r", mmap=False) as nc:
+        value = getattr(nc, "epoch_utc", None)
+    if isinstance(value, bytes):
+        value = value.decode("ascii", errors="replace")
+    if value is None:
+        raise ValueError(f"Weather cube has no epoch_utc attribute: {cube_path}")
+    try:
+        actual = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"Invalid epoch_utc in weather cube {cube_path}: {value}") from error
+    if actual.tzinfo is None:
+        actual = actual.replace(tzinfo=timezone.utc)
+    if expected_epoch.tzinfo is None:
+        expected_epoch = expected_epoch.replace(tzinfo=timezone.utc)
+    difference = abs((actual - expected_epoch).total_seconds())
+    if difference > tolerance_seconds:
+        raise ValueError(
+            f"Weather cube epoch mismatch for {cube_path}: cube={actual.isoformat()}, "
+            f"PRM={expected_epoch.isoformat()}, difference={difference:.1f}s "
+            f"(tolerance {tolerance_seconds}s)"
+        )
+    return True
+
+
+def _weather_dirs(stage_dir, project_dir, weather_dir):
+    candidates = []
+    if weather_dir and os.path.isdir(weather_dir):
+        candidates.append(Path(weather_dir))
+    candidates.extend((Path(stage_dir) / "weather", Path(stage_dir), Path(project_dir) / "weather"))
+    return candidates
+
+
+def locate_era5_raw(stage_dir, project_dir, weather_dir):
+    for directory in _weather_dirs(stage_dir, project_dir, weather_dir):
+        if directory.is_dir():
+            matches = sorted(directory.glob("*era5*raw*.npz"))
+            if matches:
+                return matches[0]
+    return None
+
+
+def dem_bbox(dem_path, margin=0.75):
+    ds = gdal.Open(str(dem_path))
+    if ds is None:
+        raise FileNotFoundError(f"Could not open geographic DEM: {dem_path}")
+    gt = ds.GetGeoTransform()
+    if gt[2] != 0 or gt[4] != 0:
+        raise ValueError(f"Rotated geographic DEM geotransform is unsupported: {dem_path}")
+    x0, x1 = gt[0], gt[0] + ds.RasterXSize * gt[1]
+    y0, y1 = gt[3], gt[3] + ds.RasterYSize * gt[5]
+    return min(x0, x1) - margin, max(x0, x1) + margin, min(y0, y1) - margin, max(y0, y1) + margin
+
+
+def ensure_weather_cubes(stage_dir, project_dir, weather_dir, master_prm, slave_prm, dem_path):
+    m_nc, s_nc = locate_weather_cubes(stage_dir, project_dir, weather_dir)
+    master_epoch = prm_epoch_utc(master_prm)
+    slave_epoch = prm_epoch_utc(slave_prm)
+    if not m_nc or not s_nc:
+        raw_path = locate_era5_raw(stage_dir, project_dir, weather_dir)
+        if raw_path is not None:
+            from era5_weather import build_cube
+
+            with np.load(raw_path, allow_pickle=False) as archive:
+                raw = {name: archive[name] for name in archive.files}
+            bbox = dem_bbox(dem_path)
+            weather_out = Path(stage_dir) / "weather"
+            weather_out.mkdir(parents=True, exist_ok=True)
+            m_nc = build_cube(raw, master_epoch, bbox, None, weather_out / "master_weather.nc")
+            s_nc = build_cube(raw, slave_epoch, bbox, None, weather_out / "slave_weather.nc")
+    if not m_nc or not s_nc:
+        raise FileNotFoundError(
+            "Weather cubes (master_weather.nc / slave_weather.nc) not found; "
+            "provide matching cubes or an *era5*raw*.npz file."
+        )
+    validate_cube_epoch(m_nc, master_epoch)
+    validate_cube_epoch(s_nc, slave_epoch)
+    return m_nc, s_nc, master_epoch, slave_epoch
+
+
+def _grid_axes(ds):
+    gt = ds.GetGeoTransform()
+    if gt[2] != 0 or gt[4] != 0:
+        raise ValueError("Rotated radar grid geotransforms are unsupported for atmospheric resampling")
+    x = gt[0] + (np.arange(ds.RasterXSize) + 0.5) * gt[1]
+    y = gt[3] + (np.arange(ds.RasterYSize) + 0.5) * gt[5]
+    return x, y
+
+
+def fill_and_resample(temp_grid, source_grid, output_grid, radius=300):
+    temp = gdal.Open(str(temp_grid))
+    if temp is None:
+        raise FileNotFoundError(f"Could not open projected atmospheric grid: {temp_grid}")
+    source = gdal.Open(str(source_grid))
+    if source is None:
+        raise FileNotFoundError(f"Could not open source phase grid: {source_grid}")
+    values = temp.GetRasterBand(1).ReadAsArray().astype(np.float64)
+    nodata = temp.GetRasterBand(1).GetNoDataValue()
+    if nodata is not None:
+        values[values == nodata] = np.nan
+    bad = ~np.isfinite(values)
+    if np.all(bad):
+        filled = np.full_like(values, np.nan)
+    else:
+        distance, (rows, cols) = ndimage.distance_transform_edt(bad, return_indices=True)
+        filled = values[rows, cols]
+        filled[distance > radius] = np.nan
+    x, y = _grid_axes(temp)
+    if x[0] > x[-1]:
+        x, filled = x[::-1], filled[:, ::-1]
+    if y[0] > y[-1]:
+        y, filled = y[::-1], filled[::-1, :]
+    target_x, target_y = _grid_axes(source)
+    xx, yy = np.meshgrid(target_x, target_y)
+    resampled = RegularGridInterpolator(
+        (y, x), filled, bounds_error=False, fill_value=np.nan
+    )(np.column_stack((yy.ravel(), xx.ravel()))).reshape(xx.shape)
+    output_grid = Path(output_grid)
+    output_grid.parent.mkdir(parents=True, exist_ok=True)
+    if output_grid.exists():
+        output_grid.unlink()
+    driver = gdal.GetDriverByName("netCDF")
+    out = driver.Create(
+        str(output_grid), source.RasterXSize, source.RasterYSize, 1, gdal.GDT_Float32
+    )
+    if out is None:
+        raise RuntimeError(f"Could not create resampled atmospheric grid: {output_grid}")
+    out.SetGeoTransform(source.GetGeoTransform())
+    out.SetProjection(source.GetProjection())
+    band = out.GetRasterBand(1)
+    band.SetNoDataValue(float("nan"))
+    band.WriteArray(resampled.astype(np.float32))
+    out.FlushCache()
+    out = None
+    return resampled.astype(np.float32)
+
+
+def _remove_plane(values, mask, step=4):
+    nrows, ncols = values.shape
+    sampled = mask[::step, ::step] & np.isfinite(values[::step, ::step])
+    if sampled.sum() < 3:
+        rows, cols = np.nonzero(mask & np.isfinite(values))
+        zs = values[rows, cols].astype(np.float64)
+        xs, ys = cols / ncols, rows / nrows
+    else:
+        rows, cols = np.nonzero(sampled)
+        rows, cols = rows * step, cols * step
+        zs = values[::step, ::step][sampled].astype(np.float64)
+        xs, ys = cols / ncols, rows / nrows
+    design = np.column_stack((np.ones_like(xs), xs, ys))
+    coefficients, _, _, _ = np.linalg.lstsq(design, zs, rcond=None)
+    residual = np.array(values, dtype=np.float32, copy=True)
+    residual -= coefficients[0]
+    residual -= (coefficients[1] * np.arange(ncols, dtype=np.float32) / ncols)[None, :]
+    residual -= (coefficients[2] * np.arange(nrows, dtype=np.float32) / nrows)[:, None]
+    return residual, coefficients
+
+
+def correct_phase(unw_arr, atm_arr, valid_unw, fit_mask, scale=1.0):
+    usable = valid_unw & np.isfinite(atm_arr)
+    fit_mask = fit_mask & usable
+    if np.count_nonzero(fit_mask) < 3:
+        raise ValueError("Insufficient valid pixels to fit atmospheric plane")
+    atm_strat, _ = _remove_plane(atm_arr, fit_mask)
+    corrected = unw_arr.astype(np.float32) - float(scale) * atm_strat.astype(np.float32)
+    ref_val = float(np.median(corrected[fit_mask]) - np.median(unw_arr[fit_mask]))
+    corrected -= ref_val
+    output = unw_arr.copy()
+    output[usable] = corrected[usable]
+    return output, atm_strat
+
+
+def _plane_removed_std(values, mask):
+    residual, _ = _remove_plane(values.astype(np.float64), mask)
+    return float(np.std(residual[mask]))
+
+
 def main():
     args = parse_args()
     stage = Path(args.stage_dir)
@@ -120,14 +321,13 @@ def main():
     master_prm, slave_prm, wavelength = parse_prms(stage)
     print(f"[Raytrace] PRMs: Master={master_prm.name}, Wavelength={wavelength:.5f} m")
 
-    m_nc, s_nc = locate_weather_cubes(stage, proj, args.weather_dir)
-    if not m_nc or not s_nc:
-        raise FileNotFoundError("Weather cubes (master_weather.nc / slave_weather.nc) not found.")
-    print(f"[Raytrace] Weather cubes: Master={m_nc}, Slave={s_nc}")
-
     dem_geo = proj / "topo/dem.grd"
     if not dem_geo.is_file():
         raise FileNotFoundError(f"Geographic DEM not found: {dem_geo}")
+    m_nc, s_nc, master_epoch, slave_epoch = ensure_weather_cubes(
+        stage, proj, args.weather_dir, master_prm, slave_prm, dem_geo
+    )
+    print(f"[Raytrace] Weather cubes: Master={m_nc}, Slave={s_nc}")
 
     trans_dat = stage / "trans.dat"
     if not trans_dat.is_file():
@@ -208,70 +408,42 @@ def main():
 
     # Project to radar coordinates
     temp_ra = stage / "temp_atm_ra.grd"
-    temp_int = stage / "temp_atm_int.grd"
     atm_ra = stage / "atm_phase_ra.grd"
 
     subprocess.run(["proj_ll2ra.csh", str(trans_dat), str(atm_ll_grd), str(temp_ra), "-I4/4"],
                    cwd=str(stage), check=True)
-    subprocess.run(["nearest_grid", str(temp_ra), str(temp_int), "300"], cwd=str(stage), check=True)
-    subprocess.run(["gmt", "grdsample", str(temp_int), f"-R{source_phase}", f"-G{atm_ra}"],
-                   cwd=str(stage), check=True)
+    atm_arr = fill_and_resample(temp_ra, source_phase, atm_ra, radius=300)
 
     # 4. Load radar grids and perform correction
     ds_unw = gdal.Open(str(source_phase))
     unw_arr = ds_unw.GetRasterBand(1).ReadAsArray().astype(np.float32)
     gt_unw = ds_unw.GetGeoTransform()
     proj_unw = ds_unw.GetProjection()
-
-    ds_atm = gdal.Open(str(atm_ra))
-    atm_arr = ds_atm.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    nrows, ncols = unw_arr.shape
 
     corr_file = stage / "corr.grd"
     if corr_file.is_file():
         ds_c = gdal.Open(str(corr_file))
         corr_arr = ds_c.GetRasterBand(1).ReadAsArray().astype(np.float32)
+        ds_c = None
     else:
         corr_arr = np.ones_like(unw_arr)
 
-    nrows, ncols = unw_arr.shape
-    y_idx, x_idx = np.mgrid[0:nrows, 0:ncols]
-
-    # Valid mask (ensure same valid footprint)
     nodata_val = ds_unw.GetRasterBand(1).GetNoDataValue()
     if nodata_val is not None:
         valid_unw = np.isfinite(unw_arr) & (unw_arr != nodata_val)
     else:
         valid_unw = np.isfinite(unw_arr) & (unw_arr != 0)
-
-    fit_mask = valid_unw & (corr_arr > 0.6)
+    fit_mask = valid_unw & np.isfinite(atm_arr) & (corr_arr > 0.6)
     if np.sum(fit_mask) < 1000:
-        fit_mask = valid_unw
+        fit_mask = valid_unw & np.isfinite(atm_arr)
 
-    # Fit 2D planar trend to atmospheric delay to isolate topographic stratification
-    step = 4
-    sub_m = fit_mask[::step, ::step]
-    xs = (x_idx[::step, ::step][sub_m] / ncols).astype(np.float64)
-    ys = (y_idx[::step, ::step][sub_m] / nrows).astype(np.float64)
-    zs = atm_arr[::step, ::step][sub_m].astype(np.float64)
-
-    A_plane = np.column_stack([np.ones_like(xs), xs, ys])
-    c_p, _, _, _ = np.linalg.lstsq(A_plane, zs, rcond=None)
-
-    X_norm = (x_idx / ncols).astype(np.float32)
-    Y_norm = (y_idx / nrows).astype(np.float32)
-    atm_plane = (c_p[0] + c_p[1] * X_norm + c_p[2] * Y_norm).astype(np.float32)
-    atm_strat = atm_arr - atm_plane
-
-    alpha = 0.280
-    corr_unw = unw_arr + alpha * atm_strat
-
-    # Reference alignment
-    ref_val = float(np.median(corr_unw[fit_mask]) - np.median(unw_arr[fit_mask]))
-    corr_unw -= ref_val
-
-    # Ensure strictly identical valid footprint as input
-    out_arr = unw_arr.copy()
-    out_arr[valid_unw] = corr_unw[valid_unw]
+    # phasediff uses SLC1*conj(SLC2), so the delay correction has this sign.
+    out_arr, atm_strat = correct_phase(unw_arr, atm_arr, valid_unw, fit_mask, args.scale)
+    before_std = _plane_removed_std(unw_arr, fit_mask)
+    after_std = _plane_removed_std(out_arr, fit_mask)
+    print(f"[Raytrace] Plane-removed unwrapped-phase std on fit_mask: before={before_std:.6f}, after={after_std:.6f} rad")
+    ds_unw = None
 
     # Export output NetCDF matching input exact structure
     drv = gdal.GetDriverByName("netCDF")

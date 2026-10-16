@@ -15,7 +15,7 @@ from scipy.io import netcdf_file
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "gmtsar-master/gmtsar/atm_raytrace.cpp"
-WRAPPER = ROOT / "gmtsar-master/gmtsar/csh/raytrace_atm.csh"
+WRAPPER = ROOT / "gmtsar-master/gmtsar/csh/atm_raytrace.csh"
 EPOCH = "2024-02-29T12:34:56Z"
 AXES = ("height", "latitude", "longitude")
 UNITS = {"height": "m", "latitude": "degrees_north", "longitude": "degrees_east",
@@ -400,7 +400,7 @@ class AtmRaytrace(unittest.TestCase):
     def wrapper_layout(self, name):
         directory = self.folder / name / "csh scripts"
         directory.mkdir(parents=True)
-        wrapper = directory / "raytrace_atm.csh"
+        wrapper = directory / "atm_raytrace.csh"
         shutil.copy2(WRAPPER, wrapper)
         return wrapper
 
@@ -451,7 +451,7 @@ class AtmRaytrace(unittest.TestCase):
         env["PATH"] = str(wrapper.parent)
         result = self.invoke(command=[wrapper], env=env)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(sorted(p.name for p in wrapper.parent.iterdir()), ["raytrace_atm.csh"])
+        self.assertEqual(sorted(p.name for p in wrapper.parent.iterdir()), ["atm_raytrace.csh"])
 
 
 if __name__ == "__main__":
