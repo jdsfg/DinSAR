@@ -646,6 +646,24 @@ def _stage_stats(name, st, pts, meas, valid, inl, info, t):
     return stats
 
 
+def _debug_stage(name, points, inliers, model):
+    directory = os.environ.get("MSREG_DEBUG_DIR")
+    if not directory:
+        return
+    try:
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, name + ".tsv")
+        predicted_r, predicted_a = model.predict(points[:, 0], points[:, 1])
+        with open(path, "w") as f:
+            f.write("index\tx\ty\tdr\tda\tncc\tpsr\tedge\tinlier\tresidual_r\tresidual_a\n")
+            for i, point in enumerate(points):
+                f.write("%d\t%.6f\t%.6f\t%.9f\t%.9f\t%.9f\t%.9f\t%.9f\t%d\t%.12g\t%.12g\n"
+                        % (i, point[0], point[1], point[2], point[3], point[4],
+                           point[5], point[6], int(inliers[i]),
+                           point[2] - predicted_r[i], point[3] - predicted_a[i]))
+    except OSError as e:
+        log("debug dump failed for %s: %s" % (name, e))
+
 def estimate(master_prm, slave_prm, schedule=DEFAULT_SCHEDULE, prep="sqrt", ncc_min=0.08,
              global_target=1500, seed=0, ovs_override=None):
     rng = np.random.default_rng(seed)
@@ -694,6 +712,7 @@ def estimate(master_prm, slave_prm, schedule=DEFAULT_SCHEDULE, prep="sqrt", ncc_
                 report["warnings"].append("%s 尺度几何拟合失败，沿用 %s 的结果" % (name, last_ok["name"]))
             break
         new_model, inl_v, info = fit
+        _debug_stage(name, meas[valid], inl_v, new_model)
         stats = _stage_stats(name, st, pts, meas, valid, inl_v, info, time.time() - t0)
         ok = (stats["n_inliers"] >= st["min_inl"]) and (stats["inlier_frac"] >= st["min_frac"])
         stats["accepted"] = bool(ok)
@@ -868,6 +887,8 @@ def write_text_log(path, report, master_prm, slave_prm):
                         "%.3f" % s["robust_sigma_a"] if s.get("robust_sigma_a") is not None else "-", s["accepted"]))
     for w in report.get("warnings", []):
         lines.append("warning: %s" % w)
+    if "engine" in report:
+        lines.append("engine = %s" % report["engine"])
     for key in ("check", "gate", "resample", "verify", "outputs"):
         if key in report:
             lines.append("%s = %s" % (key, json.dumps(_clean(report[key]), ensure_ascii=False)))
@@ -892,8 +913,70 @@ def _build_schedule(scales):
     return tuple(out)
 
 
+def _find_c_engine():
+    candidates = []
+    configured = os.environ.get("MS_REGISTER_BIN")
+    if configured:
+        candidates.append(configured)
+    on_path = shutil.which("ms_register")
+    if on_path:
+        candidates.append(on_path)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    candidates.append(os.path.join(repo_root, "gmtsar-master", "gmtsar", "ms_register"))
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return os.path.abspath(candidate)
+    raise InputError("native ms_register binary not found; build gmtsar-master/gmtsar/ms_register or use --engine python")
+
+
+def run_c_estimate(args):
+    binary = _find_c_engine()
+    cmd = [binary, "estimate", args.master, args.slave,
+           "--threads", str(args.threads), "--seed", str(args.seed),
+           "--global-target", str(args.global_target), "--prep", args.prep]
+    if args.output:
+        cmd += ["--output", args.output]
+    if args.report:
+        cmd += ["--report", args.report]
+    if args.log:
+        cmd += ["--log", args.log]
+    if args.points:
+        cmd += ["--points", args.points]
+    if args.scales:
+        cmd += ["--scales", args.scales]
+    if args.ovs:
+        cmd += ["--ovs", args.ovs]
+    if args.write_on_fail:
+        cmd.append("--write-on-fail")
+    if args.quiet:
+        cmd.append("--quiet")
+    log("registration estimate engine: c (%s)" % binary)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          universal_newlines=True)
+    if proc.stdout:
+        for line in proc.stdout.rstrip().splitlines():
+            log(line)
+    if proc.returncode not in (EXIT_OK, EXIT_GATE, EXIT_INPUT, 4):
+        raise InputError("native ms_register exited with status %d" % proc.returncode)
+    try:
+        with open(args.report, "r") as f:
+            report = json.load(f)
+    except (OSError, ValueError) as e:
+        if proc.returncode not in (EXIT_INPUT, 4):
+            raise InputError("native ms_register did not produce a readable report: %s" % e)
+        report = {"status": "failed", "fail_reason": str(e), "stages": [], "warnings": []}
+    report["engine"] = "c"
+    write_report(args.report, report)
+    write_text_log(args.log, report, args.master, args.slave)
+    return proc.returncode, report
+
+
 def run_estimate(args):
     """估计 + 质量门限 + 落盘 (PRM/点位/报告/日志)。返回 (退出码, 报告 dict)。"""
+    if getattr(args, "engine", "python") == "c":
+        return run_c_estimate(args)
+    if hasattr(args, "engine"):
+        log("registration estimate engine: python")
     master = SLC(args.master)
     slave = SLC(args.slave)
     schedule = _build_schedule([int(v) for v in args.scales.split(",")] if args.scales else None)
@@ -1157,6 +1240,8 @@ def main(argv=None):
     pr.add_argument("--interp", type=int, choices=[1, 2, 3, 4], default=4,
                     help="resamp 插值方式: 1 最近邻, 2 双线性, 3 双二次, 4 双 sinc (默认 4)")
     pr.add_argument("--resamp", help="resamp 可执行文件 (默认在 PATH 中查找)")
+    pr.add_argument("--engine", choices=["c", "python"], default="c",
+                    help="配准估计引擎: 原生 C (默认) 或 Python 参考实现")
     pr.add_argument("--scales", help="逗号分隔的窗口序列, 默认 512,256,128,64")
     pr.add_argument("--prep", choices=["sqrt", "amp", "log"], default="sqrt")
     pr.add_argument("--global-target", type=int, default=1500, help="全局尺度多视后长边像素数")
