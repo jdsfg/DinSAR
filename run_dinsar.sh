@@ -783,6 +783,31 @@ PYPRF
 # 输出文件名与 legacy 流程相同 (${SLAVE_DATE}RS.PRM / RS.SLC), 下游步骤不必区分; 未通过复核时直接中止,
 # 不退回 legacy, 避免把没通过质量门限的配准结果悄悄交给后面的步骤。
 #-----------------------------------------------------------------------------
+ms_register_python_engine_requested() {
+    local args=" ${MS_REGISTER_ARGS:-} "
+    [[ "$args" == *" --engine python "* || "$args" == *" --engine=python "* ]]
+}
+
+preflight_ms_register() {
+    [ "$COREG_MODE" = "multiscale" ] || return 0
+    ms_register_python_engine_requested && return 0
+
+    local candidate
+    if [ -n "${MS_REGISTER_BIN:-}" ] && [ -f "$MS_REGISTER_BIN" ] && [ -x "$MS_REGISTER_BIN" ]; then
+        return 0
+    fi
+    candidate=$(type -P ms_register 2>/dev/null) || candidate=""
+    if [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ]; then
+        return 0
+    fi
+    candidate="$SCRIPT_DIR/gmtsar-master/gmtsar/ms_register"
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+        return 0
+    fi
+
+    error_exit "多尺度配准需要原生 ms_register 二进制。请运行 make -C gmtsar-master/gmtsar ms_register，或设置 MS_REGISTER_ARGS=\"--engine python\""
+}
+
 find_ms_register() {
     local c
     if c=$(command -v ms_register.py 2>/dev/null); then
@@ -1837,6 +1862,7 @@ main() {
     
     # 数据发现
     discover_data || exit 1
+    preflight_ms_register || exit 1
     
     # 确认开始
     if [ "$INTERACTIVE" = true ]; then

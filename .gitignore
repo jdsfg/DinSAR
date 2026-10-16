@@ -10,6 +10,7 @@
 *.o
 *.a
 *.so
+gmtsar-master/gmtsar/ms_register
 config.log
 config.status
 make.log

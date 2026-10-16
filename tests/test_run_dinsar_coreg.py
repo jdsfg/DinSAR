@@ -82,6 +82,22 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("--coreg legacy|multiscale", r.stdout)
 
+    def test_multiscale_binary_preflight_and_python_override(self):
+        with tempfile.TemporaryDirectory() as script_dir:
+            r = run_bash(
+                'source ./run_dinsar.sh; LOG_FILE=/dev/null; SCRIPT_DIR="%s"; PATH=/nonexistent; '
+                'COREG_MODE=multiscale; MS_REGISTER_BIN=/missing/ms_register; MS_REGISTER_ARGS=""; '
+                'error_exit() { echo "preflight_error: $*"; return 42; }; '
+                'preflight_ms_register; echo "missing_rc=$?"; '
+                'MS_REGISTER_ARGS="--engine python"; preflight_ms_register; echo "python_rc=$?"'
+                % script_dir
+            )
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("missing_rc=42", r.stdout)
+        self.assertIn("make -C gmtsar-master/gmtsar ms_register", r.stdout)
+        self.assertIn('MS_REGISTER_ARGS="--engine python"', r.stdout)
+        self.assertIn("python_rc=0", r.stdout)
+
     def test_sourcing_does_not_run_main(self):
         r = run_bash("source ./run_dinsar.sh; echo sourced")
         self.assertEqual(r.stdout.strip().splitlines()[-1], "sourced")
