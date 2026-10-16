@@ -37,11 +37,11 @@ and the geographic DEM bounds expanded by 0.75 degrees.
 Fetch the hourly ARCO-ERA5 inputs with:
 
 ```sh
-python3 gmtsar-master/gmtsar/csh/era5_weather.py fetch --bbox 108/109/40/41 \
+python3 gmtsar-master/gmtsar/csh/era5_weather.py fetch --bbox 107.25/112/39.25/42.25 \
   --epoch 2026-09-04T04:23:44Z --epoch 2026-09-12T04:23:44Z --out era5_raw.npz
 ```
 
-ERA5 dates in 2026 are ERA5T preliminary data. The workflow's physical phase
+The fetch bbox must cover the DEM bounds plus the 0.75 degree margin (the example is the DJ1 scene). The fetch needs `pip install xarray "zarr<3" gcsfs` and internet access; it can run on another machine and only the npz needs to be copied. ERA5 dates in 2026 are ERA5T preliminary data. The workflow's physical phase
 correction subtracts the plane-removed atmospheric phase; its `--scale` option
 defaults to `1.0`.
 
