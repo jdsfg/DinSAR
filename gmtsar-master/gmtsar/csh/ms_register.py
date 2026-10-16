@@ -473,6 +473,24 @@ class Affine:
         return dict(cr=[float(v) for v in self.cr], ca=[float(v) for v in self.ca])
 
 
+def _residual_metrics(rr, ra):
+    """只补充报告，不参与拟合/门禁；不足 4 点时残差统计为 null，而不是 0。"""
+    metrics = dict(mad_definition="median(abs(residual - median(residual)))",
+                   robust_sigma_definition="1.4826 * MAD (median-centered)",
+                   rmse_definition="sqrt(mean(residual**2)); no mean subtraction",
+                   metric_units="pixel", metric_min_points=4)
+    for axis, residual in (("r", rr), ("a", ra)):
+        mad = rmse = None
+        if len(residual) >= 4:
+            with np.errstate(over="ignore", invalid="ignore"):
+                mad = float(np.median(np.abs(residual - np.median(residual))))
+                rmse = float(np.sqrt(np.mean(residual ** 2)))
+        metrics["mad_" + axis] = mad
+        metrics["robust_sigma_" + axis] = 1.4826 * mad if mad is not None else None
+        metrics["rmse_" + axis] = rmse
+    return _clean(metrics)
+
+
 def fit_affine_robust(x, y, dr, da, thr, rng, n_iter=1500, floor=0.2):
     """RANSAC(MSAC 打分) + Tukey IRLS。返回 (Affine, inlier_mask, info) 或 None。"""
     n = len(x)
@@ -534,6 +552,12 @@ def fit_affine_robust(x, y, dr, da, thr, rng, n_iter=1500, floor=0.2):
     info = dict(sigma=float(sigma), t_in=float(t_in),
                 rms_r=float(np.sqrt(np.mean(resid[:, 0] ** 2))),
                 rms_a=float(np.sqrt(np.mean(resid[:, 1] ** 2))))
+    # 必须沿用最终 lstsq 的输入内点，不用返回前重新计算的 full <= t_in 掩膜。
+    info.update(_residual_metrics(resid[:, 0], resid[:, 1]))
+    info.update(rms_definition=info["rmse_definition"],
+                metric_population="final least-squares input inliers; before returned mask recomputation",
+                metric_n_points=int(inl.sum()),
+                sigma_definition="1.4826 * median(abs(residual)); pooled r/a on inl0 before least-squares refinement; not median-centered MAD")
     return model, full <= t_in, info
 
 
@@ -608,11 +632,18 @@ def measure_points(master, slave, model, pts, W, R, prep="sqrt", ovs=(1, 1), zer
 # 逐级估计
 # ----------------------------------------------------------------------------
 def _stage_stats(name, st, pts, meas, valid, inl, info, t):
-    return dict(name=name, window=st["W"], search=st["R"], n_points=len(pts), n_measured=int(len(meas)),
-                n_valid=int(valid.sum()), n_inliers=int(inl.sum()) if inl is not None else 0,
-                inlier_frac=float(inl.sum()) / max(int(valid.sum()), 1) if inl is not None else 0.0,
-                rms_r=info.get("rms_r") if info else None, rms_a=info.get("rms_a") if info else None,
-                time_s=round(t, 2))
+    stats = dict(name=name, window=st["W"], search=st["R"], n_points=len(pts), n_measured=int(len(meas)),
+                 n_valid=int(valid.sum()), n_inliers=int(inl.sum()) if inl is not None else 0,
+                 inlier_frac=float(inl.sum()) / max(int(valid.sum()), 1) if inl is not None else 0.0,
+                 rms_r=info.get("rms_r") if info else None, rms_a=info.get("rms_a") if info else None,
+                 time_s=round(t, 2))
+    stats.update(_residual_metrics([], []))
+    stats.update(rms_definition=stats["rmse_definition"],
+                 metric_population="final least-squares input inliers; before returned mask recomputation",
+                 metric_n_points=0)
+    if info:
+        stats.update(info)
+    return stats
 
 
 def estimate(master_prm, slave_prm, schedule=DEFAULT_SCHEDULE, prep="sqrt", ncc_min=0.08,
@@ -670,9 +701,10 @@ def estimate(master_prm, slave_prm, schedule=DEFAULT_SCHEDULE, prep="sqrt", ncc_
         stats["center_dr"], stats["center_da"] = float(cdr), float(cda)
         stats["model"] = new_model.as_dict()
         report["stages"].append(stats)
-        log("  %s: 点 %d, 有效 %d, 内点 %d (%.0f%%), rms=(%.3f,%.3f)px, 中心偏移=(%+.2f,%+.2f), %.1fs %s"
+        log("  %s: 点 %d, 有效 %d, 内点 %d (%.0f%%), rmse=(%.3f,%.3f)px, robust_sigma=(%.3f,%.3f)px, 中心偏移=(%+.2f,%+.2f), %.1fs %s"
             % (name, len(pts), stats["n_valid"], stats["n_inliers"], 100 * stats["inlier_frac"],
-               info["rms_r"], info["rms_a"], cdr, cda, stats["time_s"], "通过" if ok else "未通过"))
+               info["rms_r"], info["rms_a"], info["robust_sigma_r"], info["robust_sigma_a"],
+               cdr, cda, stats["time_s"], "通过" if ok else "未通过"))
         if not ok:
             if last_ok is not None:
                 report["warnings"].append("%s 尺度内点 %d (%.0f%%) 未达标，沿用 %s 的结果" % (
@@ -704,21 +736,30 @@ def check_model(master, slave, model, W=128, R=8, grid=(14, 14), prep="sqrt", nc
     pts = make_lattice(master, slave, model, W, R, grid, tex=tex, phase=phase)
     meas = measure_points(master, slave, model, pts, W, R, prep=prep, ovs=ovs)
     n_pts = len(pts)
-    if len(meas) == 0:
-        return dict(n_points=n_pts, n_valid=0, valid_frac=0.0)
-    ok = (meas[:, 4] >= ncc_min) & (meas[:, 6] < 0.5)
+    ok = (meas[:, 4] >= ncc_min) & (meas[:, 6] < 0.5) if len(meas) else np.zeros(0, bool)
     m = meas[ok]
-    if len(m) < 4:
-        return dict(n_points=n_pts, n_valid=int(len(m)), valid_frac=len(m) / max(n_pts, 1))
     pr, pa = model.predict(m[:, 0], m[:, 1])
     rr, ra = m[:, 2] - pr, m[:, 3] - pa
+    n_within = int(np.count_nonzero(np.hypot(rr, ra) <= 0.3))
+    stats = dict(n_points=n_pts, n_valid=int(len(m)), valid_frac=len(m) / max(n_pts, 1),
+                 n_within_0p3=n_within,
+                 frac_within_0p3_all_candidates=n_within / n_pts if n_pts else None,
+                 within_0p3_definition="hypot(residual_r, residual_a) <= 0.3 pixel; no centering",
+                 frac_within_0p3_definition="n_within_0p3 / n_valid (legacy; requires >=4 valid points)",
+                 frac_within_0p3_all_candidates_definition="n_within_0p3 / n_points; null if no candidates",
+                 metric_population="valid independent check points (ncc >= ncc_min and edge < 0.5)",
+                 metric_n_points=int(len(m)))
+    stats.update(_residual_metrics(rr, ra))
+    stats["rms_definition"] = stats["robust_sigma_definition"] + "; legacy rms_r/rms_a are not RMSE"
+    if len(m) < 4:
+        return stats
     mad = lambda v: 1.4826 * float(np.median(np.abs(v - np.median(v))))
-    return dict(n_points=n_pts, n_valid=int(len(m)), valid_frac=len(m) / max(n_pts, 1),
-                median_r=float(np.median(rr)), median_a=float(np.median(ra)),
-                rms_r=mad(rr), rms_a=mad(ra),
-                max_abs_r=float(np.max(np.abs(rr - np.median(rr)))), max_abs_a=float(np.max(np.abs(ra - np.median(ra)))),
-                frac_within_0p3=float(np.mean(np.hypot(rr, ra) <= 0.3)),
-                residuals=np.column_stack([m[:, 0], m[:, 1], rr, ra, m[:, 4]]))
+    stats.update(median_r=float(np.median(rr)), median_a=float(np.median(ra)),
+                 rms_r=mad(rr), rms_a=mad(ra),
+                 max_abs_r=float(np.max(np.abs(rr - np.median(rr)))), max_abs_a=float(np.max(np.abs(ra - np.median(ra)))),
+                 frac_within_0p3=float(np.mean(np.hypot(rr, ra) <= 0.3)),
+                 residuals=np.column_stack([m[:, 0], m[:, 1], rr, ra, m[:, 4]]))
+    return stats
 
 
 # ----------------------------------------------------------------------------
@@ -819,10 +860,12 @@ def write_text_log(path, report, master_prm, slave_prm):
     if g.get("ok"):
         lines.append("global: dr=%.2f da=%.2f ncc=%.3f psr=%.1f" % (g["dr"], g["da"], g["ncc"], g["psr"]))
     for s in report.get("stages", []):
-        lines.append("stage %s: points=%d valid=%d inliers=%d (%.0f%%) rms=(%s,%s) accepted=%s"
+        lines.append("stage %s: points=%d valid=%d inliers=%d (%.0f%%) rmse=(%s,%s) robust_sigma=(%s,%s) accepted=%s"
                      % (s["name"], s["n_points"], s["n_valid"], s["n_inliers"], 100 * s["inlier_frac"],
                         "%.3f" % s["rms_r"] if s.get("rms_r") is not None else "-",
-                        "%.3f" % s["rms_a"] if s.get("rms_a") is not None else "-", s["accepted"]))
+                        "%.3f" % s["rms_a"] if s.get("rms_a") is not None else "-",
+                        "%.3f" % s["robust_sigma_r"] if s.get("robust_sigma_r") is not None else "-",
+                        "%.3f" % s["robust_sigma_a"] if s.get("robust_sigma_a") is not None else "-", s["accepted"]))
     for w in report.get("warnings", []):
         lines.append("warning: %s" % w)
     for key in ("check", "gate", "resample", "verify", "outputs"):
@@ -863,7 +906,7 @@ def run_estimate(args):
         check = check_model(master, slave, model, prep=args.prep, ovs=ovs or CHECK_OVS)
         report["check"] = _clean(check)
         report["check_time_s"] = round(time.time() - t0, 2)
-        log("  独立点复核(模型预测): 有效 %s/%s, 残余中位数=(%s,%s), rms=(%s,%s)" % (
+        log("  独立点复核(模型预测): 有效 %s/%s, 残余中位数=(%s,%s), robust_sigma=(%s,%s)" % (
             check.get("n_valid"), check.get("n_points"),
             "%+.3f" % check["median_r"] if "median_r" in check else "-",
             "%+.3f" % check["median_a"] if "median_a" in check else "-",
@@ -916,7 +959,7 @@ def verify_registered(master, slave, grid=(14, 14), prep="sqrt"):
         if max(chk["rms_r"], chk["rms_a"]) > gate["check_rms"]:
             reasons.append("残余 rms (%.3f,%.3f) > %.2f px" % (chk["rms_r"], chk["rms_a"], gate["check_rms"]))
     if "median_r" in chk:
-        log("复核: 有效 %d/%d, 残余中位数=(%+.3f,%+.3f)px, rms=(%.3f,%.3f)px, 0.3px内占 %.0f%%" % (
+        log("复核: 有效 %d/%d, 残余中位数=(%+.3f,%+.3f)px, robust_sigma=(%.3f,%.3f)px, 0.3px内占有效点 %.0f%%" % (
             chk["n_valid"], chk["n_points"], chk["median_r"], chk["median_a"], chk["rms_r"], chk["rms_a"],
             100 * chk["frac_within_0p3"]))
     return chk, dict(passed=not reasons, reasons=reasons, thresholds=gate)

@@ -55,3 +55,7 @@ config.20*.txt
 *.tmp
 temp/
 test_data/
+
+# Python bytecode and GMT session history
+__pycache__/
+gmt.history
