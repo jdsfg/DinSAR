@@ -13,6 +13,7 @@
 - `gmtsar-master/preproc/DJ1_preproc/src_swath/dj1_pair_select.py ROOT [--json pairs.json]`：只读 XML 的像对筛选。
 - `make_slc_dj1h5.py PRODUCT.XML PRODUCT.h5 20260904`（需要 numpy 和 h5py）：转成 GMTSAR 的 `.SLC/.PRM/.LED`，并写转换说明 `.convert.txt`。实时轨道只覆盖成像时段，转换时会外推到场景前后；PRM 的 `fd1` 固定为 0（零多普勒产品，非零值会让 `SAT_llt2rat` 的方位坐标错开上千行）。PRM 里没有 `SC_vel/earth_radius/SC_height`，按 GMTSAR 惯例用 `calc_dop_orb` 追加（从影像沿用主影像的 `earth_radius`）。
 - `gmtsar-master/gmtsar/csh/ms_register.py register M.PRM S.PRM ...`：多尺度配准（不依赖 PRM 里的初始偏移；估计、`resamp` 重采样、独立点位复核一步完成，未通过复核时返回非 0 且不留下半成品）。
+`register` 默认使用原生 C 估计器；可用 `--engine python` 选择保留的 Python 参考实现。构建 C 程序：`make -C gmtsar-master/gmtsar ms_register`。也可通过 `MS_REGISTER_BIN` 指定可执行文件。
 - `run_dinsar.sh --coreg multiscale`：在流水线里启用多尺度配准，默认 `legacy`（`xcorr + fitoffset`，行为不变）。复核未通过会直接中止，不会悄悄退回 legacy。
 
 `run_dinsar.sh` 现在可以直接处理新版 XML + HDF5：`raw/` 里放 XML 和同名 `.h5`（同名 `.tiff` 只是 8 bit 预览图，有 `.h5` 时不用它），其余步骤自动完成——转换 SLC、用 `calc_dop_orb` 补轨道参数、默认 multiscale 配准、DEM 转雷达坐标、去地形相位、滤波、解缠、去趋势、地理编码。DEM 放 `topo/dem.grd` 或 `topo/dem.tif`（高程须是相对 WGS84 椭球的高，SRTM/Copernicus 的正高要先加大地水准面起伏）。
