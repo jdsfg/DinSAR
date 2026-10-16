@@ -19,6 +19,8 @@ import shutil
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -69,6 +71,28 @@ class RegisterCommand(unittest.TestCase):
     def _report(out):
         with open(os.path.join(out, "coreg_report.json")) as f:
             return json.load(f)
+
+    def test_native_verify_uses_requested_options(self):
+        check = {"n_valid": 8}
+        gate = {"passed": True, "reasons": [], "thresholds": {}}
+
+        def fake_run(cmd, **kwargs):
+            report_path = cmd[cmd.index("--report") + 1]
+            with open(report_path, "w") as f:
+                json.dump({"check": check, "gate": gate}, f)
+            return SimpleNamespace(returncode=ms.EXIT_OK, stdout="")
+
+        with mock.patch.object(ms, "_find_c_engine", return_value="/fake/ms_register"), \
+                mock.patch.object(ms.subprocess, "run", side_effect=fake_run) as run:
+            result = ms.verify_registered_c("/master.PRM", "/out.PRM", "/out.SLC",
+                                            grid=(10, 12), prep="log", threads=3)
+
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:4], ["/fake/ms_register", "verify", "/master.PRM", "/out.PRM"])
+        for option, value in (("--slave-slc", "/out.SLC"), ("--grid", "10x12"),
+                              ("--prep", "log"), ("--threads", "3")):
+            self.assertEqual(cmd[cmd.index(option) + 1], value)
+        self.assertEqual(result, (check, gate))
 
     @unittest.skipUnless(HAVE_RESAMP, "需要 GMTSAR resamp")
     def test_end_to_end_with_real_resamp(self):

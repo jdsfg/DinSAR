@@ -956,13 +956,13 @@ def run_c_estimate(args):
     if proc.stdout:
         for line in proc.stdout.rstrip().splitlines():
             log(line)
-    if proc.returncode not in (EXIT_OK, EXIT_GATE, EXIT_INPUT, 4):
+    if proc.returncode not in (EXIT_OK, EXIT_GATE, EXIT_INPUT, EXIT_INTERNAL):
         raise InputError("native ms_register exited with status %d" % proc.returncode)
     try:
         with open(args.report, "r") as f:
             report = json.load(f)
     except (OSError, ValueError) as e:
-        if proc.returncode not in (EXIT_INPUT, 4):
+        if proc.returncode not in (EXIT_INPUT, EXIT_INTERNAL):
             raise InputError("native ms_register did not produce a readable report: %s" % e)
         report = {"status": "failed", "fail_reason": str(e), "stages": [], "warnings": []}
     report["engine"] = "c"
@@ -1106,6 +1106,32 @@ def _remove_quiet(*paths):
             pass
 
 
+def verify_registered_c(master_prm, slave_prm, slave_slc, grid=(14, 14), prep="sqrt", threads=1):
+    binary = _find_c_engine()
+    with tempfile.TemporaryDirectory(prefix="ms_register_verify_") as tmp:
+        report_path = os.path.join(tmp, "verify.json")
+        cmd = [binary, "verify", master_prm, slave_prm, "--slave-slc", slave_slc,
+               "--grid", "%dx%d" % grid, "--prep", prep, "--threads", str(threads),
+               "--report", report_path]
+        log("registration verify engine: c (%s)" % binary)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True)
+        if proc.stdout:
+            for line in proc.stdout.rstrip().splitlines():
+                log(line)
+        if proc.returncode not in (EXIT_OK, EXIT_GATE):
+            raise InputError("native ms_register verify exited with status %d" % proc.returncode)
+        try:
+            with open(report_path, "r") as f:
+                report = json.load(f)
+            check, gate = report["check"], report["gate"]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise InputError("native ms_register verify did not produce a readable report: %s" % e)
+        if not isinstance(gate, dict) or "passed" not in gate:
+            raise InputError("native ms_register verify report has an invalid gate")
+        return check, gate
+
+
 def cmd_register(args):
     t_all = time.time()
     master = SLC(args.master)
@@ -1176,7 +1202,12 @@ def cmd_register(args):
 
         if not args.skip_verify:
             t0 = time.time()
-            chk, vgate = verify_registered(master, SLC(out_prm, slc_path=out_slc), grid=args.grid, prep=args.prep)
+            if args.engine == "c":
+                chk, vgate = verify_registered_c(master.prm_path, out_prm, out_slc, grid=args.grid,
+                                                 prep=args.prep, threads=args.threads)
+            else:
+                log("registration verify engine: python")
+                chk, vgate = verify_registered(master, SLC(out_prm, slc_path=out_slc), grid=args.grid, prep=args.prep)
             report["verify"] = dict(check=_clean(chk), gate=vgate, time_s=round(time.time() - t0, 2))
             if not vgate["passed"]:
                 reason = "重采样结果复核未通过: %s" % "; ".join(vgate["reasons"])
