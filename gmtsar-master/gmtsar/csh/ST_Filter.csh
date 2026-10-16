@@ -8,10 +8,16 @@
 #  Usage: ST_Filter.csh input.grd output.grd [project_dir]
 #
 #  Method: 
-#    - If multiple interferograms exist, uses a common-point stacking approach 
-#      to estimate and remove transient atmospheric phase screen (APS).
-#    - If single pair, applies a spatial high-pass/low-pass Gaussian filter 
-#      to separate turbulent APS from deformation.
+#    - If >=3 other interferograms of identical grid size exist under
+#      <project_dir>/intf, uses a common-point stacking approach to estimate
+#      and remove transient atmospheric phase screen (APS).
+#    - Otherwise applies a spatial Gaussian low-pass to suppress turbulent APS.
+#
+#  Note: input.grd is in radar coordinates (x = range, y = azimuth, in pixels),
+#        so all filter widths are converted from metres to grid units and
+#        grdfilter runs in Cartesian mode (-D0). The pixel size is read from
+#        a *.PRM in the current directory when available, else ST_PIXEL_M
+#        (env, metres) or 3 m is used.
 #
 
 if ( $#argv < 2 ) then
@@ -35,19 +41,47 @@ endif
 
 echo "  --- Spatio-Temporal APS Filtering (Phase C) ---"
 
-# Check for stacking possibility
-set intf_list = `find $proj_dir/intf -name "unwrap.grd" | grep -v "$infile"`
-set n_stack = `echo $intf_list | wc -w`
+# Ground-equivalent pixel size (m), used to turn metre widths into grid units
+set pix_m = 3.0
+if ( $?ST_PIXEL_M ) then
+    set pix_m = $ST_PIXEL_M
+endif
+set nonomatch
+set prm_list = ( *.PRM )
+unset nonomatch
+if ( -f "$prm_list[1]" ) then
+    set fs  = `grep rng_samp_rate $prm_list[1] | head -1 | awk '{print $3}'`
+    set prf = `grep '^PRF' $prm_list[1] | head -1 | awk '{print $3}'`
+    set vel = `grep SC_vel $prm_list[1] | head -1 | awk '{print $3}'`
+    if ( "$fs" != "" && "$prf" != "" && "$vel" != "" ) then
+        set pix_m = `echo $fs $prf $vel | awk '{dr=299792458/(2*$1); da=$3/$2; printf("%.3f", (dr+da)/2)}'`
+    endif
+endif
+echo "  Pixel size used for filter widths: $pix_m m"
+
+# Peers: other interferograms of the project with the same grid as the input.
+# The input itself must be excluded by resolved path, not by name, because
+# every pair directory contains a file called unwrap.grd.
+set self_abs = `readlink -f $infile`
+set ref_dims = `gmt grdinfo $infile -C | awk '{print $10, $11}'`
+set intf_list = ()
+if ( -d $proj_dir/intf ) then
+    foreach f ( `find $proj_dir/intf -name "unwrap.grd" | sort` )
+        if ( "`readlink -f $f`" == "$self_abs" ) continue
+        set dims = `gmt grdinfo $f -C | awk '{print $10, $11}'`
+        if ( "$dims" != "$ref_dims" ) continue
+        set intf_list = ( $intf_list $f )
+    end
+endif
+set n_stack = $#intf_list
 
 if ( $n_stack >= 3 ) then
     echo "  [Mode] Multi-temporal Stacking Filter ($n_stack peers found)"
-    # Simple Temporal APS estimation: 
-    # APS_i = unw_i - median(all unw mapped to same time span)
-    # Here we use a simpler common-mode approach: 
-    # High-frequency spatial components that are inconsistent over time are APS.
+    # Common-mode approach: the mean of the peers approximates the signal that
+    # is stable over time (only meaningful for peers with similar time spans);
+    # what the current pair has on top of it, once smoothed, is taken as APS.
     
     # 1. Calculate stack mean (common deformation signal)
-    # We use a localized stack for efficiency
     gmt grdmath $intf_list[1] $intf_list[2] ADD $intf_list[3] ADD 3 DIV = tmp_stack_mean.grd
     
     # 2. Difference current with stack mean
@@ -56,7 +90,8 @@ if ( $n_stack >= 3 ) then
     
     # 3. Spatial filter the residual to get APS
     # APS is spatially smooth (~1-5km)
-    gmt grdfilter tmp_residual.grd -Gtmp_aps.grd -Fg2000 -D4
+    set w_px = `echo $pix_m | awk '{printf("%.1f", 2000/$1)}'`
+    gmt grdfilter tmp_residual.grd -Gtmp_aps.grd -Fg$w_px -D0
     
     # 4. Subtract APS from original
     gmt grdmath $infile tmp_aps.grd SUB = $outfile
@@ -64,23 +99,17 @@ if ( $n_stack >= 3 ) then
     rm -f tmp_stack_mean.grd tmp_residual.grd tmp_aps.grd
     echo "  Multi-temporal filter applied."
 else
-    echo "  [Mode] Spatial Adaptive Filter (Single-pair mode)"
-    # Atmospheric turbulence follows a power law. 
-    # We use a Gaussian high-pass filter to separate small-scale turbulence 
-    # from larger-scale deformation trends (if detrending was already done).
-    
-    # Separating APS (high-frequency spatial) from long-term signal
-    # We assume deformation is smoother than turbulent APS
-    gmt grdfilter $infile -Gtmp_lowpass.grd -Fg3000 -D4
-    gmt grdmath $infile tmp_lowpass.grd SUB = tmp_highpass.grd
-    
-    # In p2p, we often want to keep the lowpass (deformation) and remove highpass (noise)
-    # But APS can be mid-frequency. 
-    # Standard practice: Adaptive Goldstein-like but on unwrapped phase.
-    
-    # For DJ1/BC3 (X-band), we'll do a simple low-pass smoothing to suppress high-freq APS
-    gmt grdfilter $infile -G$outfile -Fg500 -D4
-    echo "  Spatial adaptive smoothing applied (Gaussian 500m)."
+    echo "  [Mode] Spatial Adaptive Filter (Single-pair mode, $n_stack comparable peers)"
+    # APS is spatially smooth relative to decorrelation noise; for X-band
+    # (DJ1/BC3) a Gaussian low-pass suppresses the high-frequency part.
+    set w_px = `echo $pix_m | awk '{printf("%.1f", 500/$1)}'`
+    gmt grdfilter $infile -G$outfile -Fg$w_px -D0
+    echo "  Spatial adaptive smoothing applied (Gaussian 500 m = $w_px px)."
+endif
+
+if ( ! -f $outfile ) then
+    echo "  ERROR: ST_Filter failed to produce $outfile"
+    exit 1
 endif
 
 echo "  ST_Filter.csh completed."

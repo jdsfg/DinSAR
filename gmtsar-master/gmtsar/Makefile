@@ -72,3 +72,7 @@ clean:
 
 $(PROGS):	$(PROGS_O) $(LIB)
 		$(CC) $(LDFLAGS) -fopenmp $@.o $(GMTSAR) $(GMT_LIB) $(LALIBS) $(LIBS)  -L$(TIFF_LIB) -ltiff -lm -lfftw3f -lfftw3f_threads -o $@
+
+# Independent normalized-weather tool; deliberately not in all/install/clean.
+atm_raytrace: atm_raytrace.cpp
+		g++ -std=c++17 -O2 -Wall -Wextra $(shell nc-config --cflags) "$<" -o "$@" $(shell nc-config --libs)
