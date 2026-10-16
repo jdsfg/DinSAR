@@ -40,7 +40,7 @@ PROGS_C		= bperp.c calc_dop_orb.c conv.c esarp.c offset_topo.c phase2topo.c \
 	  resamp_omp.c offset_topo2.c offset_topo_omp.c
  
 PROGS_O         = $(PROGS_C:.c=.o)
-PROGS           = $(PROGS_C:.c=)
+PROGS           = $(PROGS_C:.c=) ms_register
 
 #-------------------------------------------------------------------------------
 #	software targets
@@ -70,8 +70,21 @@ clean:
 #	program rules
 #-------------------------------------------------------------------------------
 
-$(PROGS):	$(PROGS_O) $(LIB)
+$(PROGS_C:.c=):	$(PROGS_O) $(LIB)
 		$(CC) $(LDFLAGS) -fopenmp $@.o $(GMTSAR) $(GMT_LIB) $(LALIBS) $(LIBS)  -L$(TIFF_LIB) -ltiff -lm -lfftw3f -lfftw3f_threads -o $@
+
+FFTW_THREADS_LIBS = $(shell ldconfig -p 2>/dev/null | grep -q libfftw3f_threads && echo -lfftw3f_threads)
+FFTW_THREADS_DEFINE = $(if $(strip $(FFTW_THREADS_LIBS)),-DMS_HAVE_FFTW_THREADS,)
+MSREG_CFLAGS = $(CFLAGS) -std=c99 -Wall -Wextra $(FFTW_THREADS_DEFINE)
+
+ms_register.o: ms_register.c msreg.h
+	$(CC) $(INCLUDES) $(MSREG_CFLAGS) -c $< -o $@
+
+msreg_%.o: msreg_%.c msreg.h
+	$(CC) $(INCLUDES) $(MSREG_CFLAGS) -c $< -o $@
+
+ms_register: ms_register.o msreg_slc.o msreg_fft.o msreg_points.o msreg_fit.o msreg_output.o $(LIB)
+	$(CC) $(LDFLAGS) ms_register.o msreg_slc.o msreg_fft.o msreg_points.o msreg_fit.o msreg_output.o $(GMTSAR) $(GMT_LIB) $(LIBS) -lm -lfftw3f $(FFTW_THREADS_LIBS) -pthread -o $@
 
 # Independent normalized-weather tool; deliberately not in all/install/clean.
 atm_raytrace: atm_raytrace.cpp
