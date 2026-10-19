@@ -36,7 +36,10 @@ THRESHOLDS = {
     "tile_seam": {
         "warn_ratio_above": 1.5,
         "fail_ratio_above": 3.0,
-        "reference_count": 20,
+        "corr_min": 0.3,
+        "minimum_seam_fraction": 0.005,
+        "reference_fraction_floor": 1e-4,
+        "reference_offsets": [5, 10, 15, 20, 25, 30, 35, 40, 45, 50],
     },
     "edge_strip": {
         "invalid_line_fraction_min": 0.9,
@@ -334,90 +337,105 @@ def _unwrap_discontinuity_check(unwrap, corr):
     )
 
 
-def _line_jump_fraction(first, second):
+def _line_jump_fraction(first, second, eligible=None):
     valid = np.isfinite(first) & np.isfinite(second)
+    if eligible is not None:
+        valid &= eligible
     count = int(np.count_nonzero(valid))
     fraction = float(np.count_nonzero(valid & (np.abs(second - first) > math.pi)) / count) if count else 0.0
     return fraction, count
 
 
-def _reference_indices(size, seams, overlap, count):
-    candidates = [
-        index
-        for index in range(1, size)
-        if index > overlap
-        and size - index > overlap
-        and all(abs(index - seam) > overlap for seam in seams)
-    ]
-    if len(candidates) > count:
-        picks = np.linspace(0, len(candidates) - 1, count).round().astype(int)
-        candidates = [candidates[index] for index in picks]
-    return candidates
-
-
-def _seam_axis(array, tile_count, overlap, axis):
-    size = array.shape[axis]
+def _seam_axis(unwrap, corr, tile_count, axis):
+    size = unwrap.shape[axis]
     seams = [int(k * size // tile_count) for k in range(1, tile_count)]
     seams = [seam for seam in seams if 0 < seam < size]
-    if axis == 0:
-        reference_indices = _reference_indices(
-            size, seams, overlap, THRESHOLDS["tile_seam"]["reference_count"]
-        )
-        reference = [
-            _line_jump_fraction(array[index - 1, :], array[index, :])[0]
-            for index in reference_indices
-        ]
-        seam_values = [
-            {
-                "index": seam,
-                "fraction": _line_jump_fraction(array[seam - 1, :], array[seam, :])[0],
-            }
-            for seam in seams
-        ]
-    else:
-        reference_indices = _reference_indices(
-            size, seams, overlap, THRESHOLDS["tile_seam"]["reference_count"]
-        )
-        reference = [
-            _line_jump_fraction(array[:, index - 1], array[:, index])[0]
-            for index in reference_indices
-        ]
-        seam_values = [
-            {
-                "index": seam,
-                "fraction": _line_jump_fraction(array[:, seam - 1], array[:, seam])[0],
-            }
-            for seam in seams
-        ]
-    reference_fraction = float(np.median(reference)) if reference else 0.0
-    for item in seam_values:
-        if reference_fraction == 0.0:
-            item["ratio"] = 1.0 if item["fraction"] == 0.0 else float(item["fraction"] / 1e-6)
+    thresholds = THRESHOLDS["tile_seam"]
+
+    def line_pair_stat(index):
+        if axis == 0:
+            first, second = unwrap[index - 1, :], unwrap[index, :]
+            first_corr, second_corr = corr[index - 1, :], corr[index, :]
         else:
-            item["ratio"] = float(item["fraction"] / reference_fraction)
+            first, second = unwrap[:, index - 1], unwrap[:, index]
+            first_corr, second_corr = corr[:, index - 1], corr[:, index]
+        eligible = (first_corr >= thresholds["corr_min"]) & (second_corr >= thresholds["corr_min"])
+        return _line_jump_fraction(first, second, eligible)
+
+    seam_values = []
+    for seam in seams:
+        fraction, neighbor_pairs = line_pair_stat(seam)
+        reference_samples = []
+        for offset in thresholds["reference_offsets"]:
+            for signed_offset in (-offset, offset):
+                index = seam + signed_offset
+                if 0 < index < size:
+                    reference_fraction, reference_pairs = line_pair_stat(index)
+                    reference_samples.append(
+                        {
+                            "index": index,
+                            "offset": signed_offset,
+                            "fraction": reference_fraction,
+                            "neighbor_pairs": reference_pairs,
+                        }
+                    )
+        local_reference = (
+            float(np.median([sample["fraction"] for sample in reference_samples]))
+            if reference_samples
+            else 0.0
+        )
+        ratio = float(fraction / max(local_reference, thresholds["reference_fraction_floor"]))
+        if fraction < thresholds["minimum_seam_fraction"]:
+            status = "PASS"
+        elif ratio > thresholds["fail_ratio_above"]:
+            status = "FAIL"
+        elif ratio > thresholds["warn_ratio_above"]:
+            status = "WARN"
+        else:
+            status = "PASS"
+        seam_values.append(
+            {
+                "index": seam,
+                "fraction": fraction,
+                "neighbor_pairs": neighbor_pairs,
+                "local_reference_fraction": local_reference,
+                "local_reference_samples": reference_samples,
+                "ratio": ratio,
+                "status": status,
+            }
+        )
+    reference_fraction = (
+        float(np.median([item["local_reference_fraction"] for item in seam_values]))
+        if seam_values
+        else None
+    )
     return {
         "seams": seam_values,
         "reference_fraction": reference_fraction,
-        "reference_lines": reference_indices,
     }
 
 
-def _tile_seam_check(unwrap, tiles, overlap):
+def _tile_seam_check(unwrap, corr, tiles, overlap):
     row_tiles, col_tiles = tiles
-    rows = _seam_axis(unwrap, row_tiles, overlap, 0)
-    cols = _seam_axis(unwrap, col_tiles, overlap, 1)
+    rows = _seam_axis(unwrap, corr, row_tiles, 0)
+    cols = _seam_axis(unwrap, corr, col_tiles, 1)
     ratios = [
         seam["ratio"]
         for axis in (rows, cols)
         for seam in axis["seams"]
-        if seam["ratio"] is not None
+        if seam["fraction"] >= THRESHOLDS["tile_seam"]["minimum_seam_fraction"]
     ]
     maximum = max(ratios) if ratios else None
-    if maximum is None:
+    seam_statuses = [
+        seam["status"]
+        for axis in (rows, cols)
+        for seam in axis["seams"]
+    ]
+    if not seam_statuses:
         status = "INFO"
-    elif maximum > THRESHOLDS["tile_seam"]["fail_ratio_above"]:
+    elif "FAIL" in seam_statuses:
         status = "FAIL"
-    elif maximum > THRESHOLDS["tile_seam"]["warn_ratio_above"]:
+    elif "WARN" in seam_statuses:
         status = "WARN"
     else:
         status = "PASS"
@@ -437,10 +455,13 @@ def _tile_seam_check(unwrap, tiles, overlap):
         {
             "warn_ratio_above": THRESHOLDS["tile_seam"]["warn_ratio_above"],
             "fail_ratio_above": THRESHOLDS["tile_seam"]["fail_ratio_above"],
-            "reference_count": THRESHOLDS["tile_seam"]["reference_count"],
+            "corr_min": THRESHOLDS["tile_seam"]["corr_min"],
+            "minimum_seam_fraction": THRESHOLDS["tile_seam"]["minimum_seam_fraction"],
+            "reference_fraction_floor": THRESHOLDS["tile_seam"]["reference_fraction_floor"],
+            "reference_offsets": THRESHOLDS["tile_seam"]["reference_offsets"],
         },
         status,
-        "接缝处 |Δunwrap|>π 的比例与远离接缝（距离大于 overlap）的参考行/列中位数之比。",
+        "仅统计接缝两侧 corr≥0.3 的邻接像元，并与接缝附近 ±5 至 ±50 行/列的局部中位数比较；绝对跃变率低于 0.5% 时不告警。",
     )
 
 
@@ -984,7 +1005,7 @@ def _run(args):
     checks.append(_congruence_check(grids["phase"], grids["unwrap"]))
     discontinuity_check, bad_pixels = _unwrap_discontinuity_check(grids["unwrap"], grids["corr"])
     checks.append(discontinuity_check)
-    checks.append(_tile_seam_check(grids["unwrap"], tiles, args.snaphu_overlap))
+    checks.append(_tile_seam_check(grids["unwrap"], grids["corr"], tiles, args.snaphu_overlap))
     checks.append(_edge_strip_check(residue_mask, valid_loops, grids["phase"]))
     ramp = _read_grid(project_dir / "debug" / "orbital_ramp.grd")
     checks.append(_detrend_check(ramp, grids["unwrap"], grids["detrended"], grids["corr"], wavelength))

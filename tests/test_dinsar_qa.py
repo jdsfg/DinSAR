@@ -196,15 +196,57 @@ class DinsarQASyntheticTests(unittest.TestCase):
         for widths in edge["value"]["width_pixels"].values():
             self.assertEqual(widths["noisy_width"], 0)
 
-    def test_injected_tile_seam_is_flagged(self):
+    def test_noisy_band_crossing_tile_seam_matches_local_reference(self):
+        unwrap = self.grids["unwrap.grd"].copy()
+        corr = self.grids["corr.grd"].copy()
+        rng = np.random.default_rng(23)
+        seam = self.ny // 2
+        start, end = seam - 55, seam + 55
+        unwrap[start:end, :] = rng.uniform(-float(np.pi), float(np.pi), (end - start, self.nx))
+        corr[start:end, :] = 0.35
+        self._write_grid(self.intf_dir / "unwrap.grd", unwrap)
+        self._write_grid(self.intf_dir / "corr.grd", corr)
+        result, report = self._run_qa()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seam_check = self._check(report, "tile_seams")
+        row_seam = seam_check["value"]["row_seams"][0]
+        self.assertEqual(seam_check["status"], "PASS")
+        self.assertGreater(row_seam["fraction"], 0.005)
+        self.assertLess(row_seam["ratio"], 1.5)
+        self.assertEqual(len(row_seam["local_reference_samples"]), 20)
+        self.assertAlmostEqual(
+            row_seam["local_reference_fraction"],
+            float(np.median([sample["fraction"] for sample in row_seam["local_reference_samples"]])),
+        )
+
+    def test_clean_field_step_on_tile_seam_fails(self):
         unwrap = self.grids["unwrap.grd"].copy()
         unwrap[self.ny // 2 :, :] += np.float32(2.0 * np.pi)
         self._write_grid(self.intf_dir / "unwrap.grd", unwrap)
         result, report = self._run_qa()
         self.assertEqual(result.returncode, 0, result.stderr)
         seam = self._check(report, "tile_seams")
-        self.assertIn(seam["status"], ("WARN", "FAIL"))
-        self.assertGreater(seam["value"]["row_seams"][0]["ratio"], 1.5)
+        row_seam = seam["value"]["row_seams"][0]
+        self.assertEqual(seam["status"], "FAIL")
+        self.assertEqual(row_seam["fraction"], 1.0)
+        self.assertEqual(row_seam["local_reference_fraction"], 0.0)
+        self.assertGreater(row_seam["ratio"], 3.0)
+
+    def test_low_coherence_tile_seam_pixels_are_excluded(self):
+        unwrap = self.grids["unwrap.grd"].copy()
+        corr = self.grids["corr.grd"].copy()
+        seam_index = self.ny // 2
+        unwrap[seam_index:, :] += np.float32(2.0 * np.pi)
+        corr[seam_index - 1 : seam_index + 1, :] = 0.2
+        self._write_grid(self.intf_dir / "unwrap.grd", unwrap)
+        self._write_grid(self.intf_dir / "corr.grd", corr)
+        result, report = self._run_qa()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seam = self._check(report, "tile_seams")
+        row_seam = seam["value"]["row_seams"][0]
+        self.assertEqual(seam["status"], "PASS")
+        self.assertEqual(row_seam["fraction"], 0.0)
+        self.assertEqual(row_seam["neighbor_pairs"], 0)
 
     def test_noncongruent_unwrap_fails_strict_mode_with_exit_two(self):
         unwrap = self.grids["unwrap.grd"] + np.float32(0.5)
