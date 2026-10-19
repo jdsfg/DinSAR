@@ -64,6 +64,7 @@ WEATHER_DIR=""       # 物理射线追踪气象数据目录 (.nc 立方体, 可�
 COREG_MODE="legacy"  # legacy=xcorr+fitoffset (默认); multiscale=多尺度配准 ms_register.py (须显式 --coreg multiscale)
 COREG_USER_SET=false # 命令行是否给了 --coreg (新版电建一号 XML+HDF5 在没给时自动改用 multiscale, 见 discover_data)
 QA_MODE="on"
+MASK_CORR="0.3"
 INPUT_FORMAT="tiff"  # tiff=旧版 XML+TIFF; h5=新版电建一号 XML+HDF5 (discover_data 里按同名 .h5 识别)
 MS_REGISTER_ARGS="${MS_REGISTER_ARGS:-}"  # 额外传给 ms_register.py register 的参数 (高级用法, 如 "--scales 512,256,128")
 GACOS_PATH=""        # GACOS 数据目录 (.ztd + .rsc)
@@ -159,6 +160,7 @@ PowerChina-1 DInSAR 数据处理脚本 v${SCRIPT_VERSION}
                                         额外参数用环境变量 MS_REGISTER_ARGS 传给 ms_register.py register
                                         新版电建一号 (XML+HDF5) 不加此项时自动用 multiscale, 其余数据仍默认 legacy
   --qa on|off|strict  产品质量检查 (默认 on；strict 时 QA FAIL 会中止流程)
+  --mask-corr T      掩膜低相干区域 (默认 0.3；0 表示不按相干性掩膜)
   --snaphu-conf auto|base|<path>
                                         SNAPHU 配置: auto (默认, 按 PRM 派生) / base (旧配置) / 指定文件
   --snaphu-overlap N                   SNAPHU 分块重叠像元数 (正整数, 默认由处理模式决定)
@@ -267,6 +269,15 @@ parse_args() {
                     on|off|strict) QA_MODE="${2,,}" ;;
                     *) error_exit "无效 --qa: $2 (on|off|strict)" ;;
                 esac
+                shift 2
+                ;;
+            --mask-corr)
+                [ "$#" -ge 2 ] || error_exit "--mask-corr 需要 [0,1) 范围内的数字"
+                if ! [[ "$2" =~ ^\+?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$ ]] ||
+                    ! awk -v value="$2" 'BEGIN { if (value + 0 < 0 || value + 0 >= 1) exit 1; exit 0 }'; then
+                    error_exit "无效 --mask-corr: $2 (必须是 [0,1) 范围内的数字)"
+                fi
+                MASK_CORR="$2"
                 shift 2
                 ;;
             --snaphu-conf)
@@ -1723,6 +1734,50 @@ EOF
     log_info "位移计算完成"
 }
 
+run_product_mask() {
+    cd "$INTF_DIR" || error_exit "无法进入干涉目录"
+    if [ ! -f los_displacement.grd ]; then
+        log_warn "未找到 LOS 位移，跳过产品掩膜生成"
+        return 0
+    fi
+
+    local slave_prm="$PROJECT_DIR/SLC/${SLAVE_DATE}.PRM"
+    if [ "$COREG_MODE" = "multiscale" ]; then
+        slave_prm="$PROJECT_DIR/SLC/${SLAVE_DATE}_est.PRM"
+    fi
+    local slave_size_prm="$PROJECT_DIR/SLC/${SLAVE_DATE}.PRM"
+    local master_prm="$PROJECT_DIR/SLC/${MASTER_DATE}.PRM"
+    local mask_corr_grid="$INTF_DIR/corr.grd"
+    if [ "$CROP_MODE" = true ] && [ -f "$INTF_DIR/corr_crop.grd" ]; then
+        mask_corr_grid="$INTF_DIR/corr_crop.grd"
+    fi
+    [ -f "$slave_prm" ] || error_exit "掩膜生成缺少配准 PRM: $slave_prm"
+    [ -f "$mask_corr_grid" ] || error_exit "掩膜生成缺少相关性网格: $mask_corr_grid"
+    [ -f "$master_prm" ] || error_exit "掩膜生成缺少主影像 PRM: $master_prm"
+
+    log_step "构建影像覆盖与相干性产品掩膜 (--mask-corr $MASK_CORR)..."
+    python3 "$SCRIPT_DIR/product_mask.py" \
+        --grid "$mask_corr_grid" \
+        --slave-prm "$slave_prm" \
+        --slave-size-prm "$slave_size_prm" \
+        --master-prm "$master_prm" \
+        --corr-thresh "$MASK_CORR" \
+        --margin-px 4 \
+        --out-mask "$INTF_DIR/product_mask.grd" \
+        --summary-json "$INTF_DIR/product_mask_summary.json" >> "$LOG_FILE" 2>&1 ||
+        error_exit "产品掩膜生成失败"
+
+    gmt grdmath "$INTF_DIR/los_displacement.grd" "$INTF_DIR/product_mask.grd" MUL \
+        = "$INTF_DIR/los_displacement_masked.grd" >> "$LOG_FILE" 2>&1 ||
+        error_exit "掩膜 LOS 位移生成失败"
+    [ -f "$INTF_DIR/los_displacement_masked.grd" ] || error_exit "未生成掩膜 LOS 位移网格"
+
+    local mask_fractions
+    mask_fractions=$(python3 -c 'import json,sys; f=json.load(open(sys.argv[1]))["fractions"]; print("overlap=%.2f%% corr=%.2f%% total=%.2f%%" % (100*f["masked_fraction_by_overlap"], 100*f["masked_fraction_by_corr"], 100*f["masked_fraction_total"]))' \
+        "$INTF_DIR/product_mask_summary.json")
+    log_info "产品掩膜统计: $mask_fractions"
+}
+
 generate_outputs() {
     log_step "[8/8] 生成输出..."
     
@@ -1800,6 +1855,10 @@ generate_outputs() {
         if [ -f los_displacement.grd ]; then
             python3 "$py_geocode" trans.dat los_displacement.grd "$results_dir/final_data_values.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
                 || log_warn "LOS 位移地理编码失败 (详见日志)"
+        fi
+        if [ -f los_displacement_masked.grd ]; then
+            python3 "$py_geocode" trans.dat los_displacement_masked.grd "$results_dir/los_displacement_masked.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
+                || log_warn "掩膜 LOS 位移地理编码失败 (详见日志)"
         fi
         
     else
@@ -2043,6 +2102,7 @@ main() {
     run_atm_correction || exit 1
     run_detrend || exit 1
     run_displacement || exit 1
+    run_product_mask || exit 1
     generate_outputs || exit 1
     run_qa || exit 1
     

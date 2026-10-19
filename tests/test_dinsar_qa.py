@@ -184,6 +184,39 @@ class DinsarQASyntheticTests(unittest.TestCase):
         self.assertEqual(right["invalid_width"], 3)
         self.assertAlmostEqual(right["noisy_width"], 15, delta=2)
 
+    def test_product_mask_reports_noisy_edge_band_coverage(self):
+        phase = self.grids["phasefilt.grd"].copy()
+        rng = np.random.default_rng(31)
+        phase[:, -18:-3] = rng.uniform(-float(np.pi), float(np.pi), (self.ny, 15))
+        phase[:, -3:] = 0.0
+        self._write_grid(self.intf_dir / "phasefilt.grd", phase)
+
+        mask = np.ones((self.ny, self.nx), dtype=np.float32)
+        mask[:, -18:] = np.nan
+        self._write_grid(self.intf_dir / "product_mask.grd", mask)
+        summary = {
+            "fractions": {
+                "masked_fraction_by_overlap": 0.1,
+                "masked_fraction_by_corr": 0.2,
+                "masked_fraction_total": 0.3,
+            }
+        }
+        (self.intf_dir / "product_mask_summary.json").write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+
+        result, report = self._run_qa()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        product_mask = self._check(report, "product_mask")
+        self.assertEqual(product_mask["status"], "INFO")
+        self.assertEqual(product_mask["value"]["masked_fraction_by_overlap"], 0.1)
+        self.assertEqual(product_mask["value"]["masked_fraction_by_corr"], 0.2)
+        self.assertEqual(product_mask["value"]["masked_fraction_total"], 0.09)
+        self.assertAlmostEqual(
+            product_mask["value"]["noisy_band_coverage_by_edge"]["right"]["masked_fraction"],
+            1.0,
+        )
+
     def test_interior_noisy_band_is_not_reported_as_edge_noise(self):
         phase = self.grids["phasefilt.grd"].copy()
         rng = np.random.default_rng(17)

@@ -474,7 +474,7 @@ def _edge_width(profile, threshold):
     return width
 
 
-def _noisy_width(profile, start, threshold, max_gap):
+def _noisy_band(profile, start, threshold, max_gap):
     band_start = next(
         (
             index
@@ -484,7 +484,7 @@ def _noisy_width(profile, start, threshold, max_gap):
         None,
     )
     if band_start is None:
-        return 0
+        return None, 0
 
     width = 0
     gap = 0
@@ -496,7 +496,11 @@ def _noisy_width(profile, start, threshold, max_gap):
             gap += 1
             if gap > max_gap:
                 break
-    return width
+    return band_start, width
+
+
+def _noisy_width(profile, start, threshold, max_gap):
+    return _noisy_band(profile, start, threshold, max_gap)[1]
 
 
 def _edge_strip_check(residue_mask, valid_loops, phasefilt):
@@ -533,9 +537,10 @@ def _edge_strip_check(residue_mask, valid_loops, phasefilt):
     }
     widths = {}
     fractions = {}
+    band_starts = {}
     for edge, (density_profile, invalid_profile) in profiles.items():
         invalid_width = _edge_width(invalid_profile, thresholds["invalid_line_fraction_min"])
-        noisy_width = _noisy_width(
+        noisy_start, noisy_width = _noisy_band(
             density_profile,
             invalid_width,
             density_threshold,
@@ -546,6 +551,7 @@ def _edge_strip_check(residue_mask, valid_loops, phasefilt):
             "invalid_width": invalid_width,
             "noisy_width": noisy_width,
         }
+        band_starts[edge] = noisy_start
         fractions[edge] = {
             "invalid_fraction": invalid_width / dimension if dimension else 0.0,
             "noisy_fraction": noisy_width / dimension if dimension else 0.0,
@@ -559,7 +565,11 @@ def _edge_strip_check(residue_mask, valid_loops, phasefilt):
     return _check(
         "edge_strip",
         "边缘残差带",
-        {"width_pixels": widths, "width_fraction": fractions},
+        {
+            "width_pixels": widths,
+            "width_fraction": fractions,
+            "noisy_band_start_offset": band_starts,
+        },
         {
             "invalid_line_fraction_min": thresholds["invalid_line_fraction_min"],
             "residue_density_above": density_threshold,
@@ -568,6 +578,62 @@ def _edge_strip_check(residue_mask, valid_loops, phasefilt):
         },
         status,
         "记录边缘零值或无效填充带宽（本身不触发告警）；远/近距向噪声带通常表示从影像在该范围无重叠（可能由距离向偏移造成），应予掩膜。",
+    )
+
+
+def _product_mask_check(intf_dir, shape, edge_check):
+    intf_dir = Path(intf_dir)
+    mask_path = intf_dir / "product_mask.grd"
+    if not mask_path.is_file():
+        return None
+    mask = _read_grid(mask_path)
+    if mask.shape != shape:
+        raise ValueError(f"product_mask 网格尺寸 {mask.shape} 与 corr {shape} 不一致")
+    valid = np.isfinite(mask) & (mask > 0.5)
+    summary_path = intf_dir / "product_mask_summary.json"
+    summary = {}
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            summary = {}
+    fractions = summary.get("fractions", {})
+    edge_widths = edge_check["value"]["width_pixels"]
+    edge_starts = edge_check["value"].get("noisy_band_start_offset", {})
+    coverage = {}
+    ny, nx = shape
+    for edge in ("top", "bottom", "left", "right"):
+        width = int(edge_widths[edge]["noisy_width"])
+        start = edge_starts.get(edge)
+        if width < 1 or start is None:
+            coverage[edge] = {"pixels": 0, "masked_fraction": None}
+            continue
+        start = int(start)
+        if edge == "top":
+            region = valid[start : start + width, :]
+        elif edge == "bottom":
+            region = valid[ny - start - width : ny - start, :]
+        elif edge == "left":
+            region = valid[:, start : start + width]
+        else:
+            region = valid[:, nx - start - width : nx - start]
+        count = int(region.size)
+        coverage[edge] = {
+            "pixels": count,
+            "masked_fraction": float(np.count_nonzero(~region) / count) if count else None,
+        }
+    return _check(
+        "product_mask",
+        "产品有效性掩膜",
+        {
+            "masked_fraction_by_overlap": fractions.get("masked_fraction_by_overlap"),
+            "masked_fraction_by_corr": fractions.get("masked_fraction_by_corr"),
+            "masked_fraction_total": float(np.count_nonzero(~valid) / valid.size),
+            "noisy_band_coverage_by_edge": coverage,
+        },
+        None,
+        "INFO",
+        "报告影像覆盖/相干性掩膜比例，以及各边缘残差噪声带中被掩膜的像元比例。",
     )
 
 
@@ -1006,7 +1072,11 @@ def _run(args):
     discontinuity_check, bad_pixels = _unwrap_discontinuity_check(grids["unwrap"], grids["corr"])
     checks.append(discontinuity_check)
     checks.append(_tile_seam_check(grids["unwrap"], grids["corr"], tiles, args.snaphu_overlap))
-    checks.append(_edge_strip_check(residue_mask, valid_loops, grids["phase"]))
+    edge_check = _edge_strip_check(residue_mask, valid_loops, grids["phase"])
+    checks.append(edge_check)
+    product_mask_check = _product_mask_check(intf_dir, shape, edge_check)
+    if product_mask_check is not None:
+        checks.append(product_mask_check)
     ramp = _read_grid(project_dir / "debug" / "orbital_ramp.grd")
     checks.append(_detrend_check(ramp, grids["unwrap"], grids["detrended"], grids["corr"], wavelength))
     del ramp
