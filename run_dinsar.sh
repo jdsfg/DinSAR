@@ -63,6 +63,7 @@ ATM_MODE="NONE" # P1-6: 默认关闭全局线性大气校正，防止引入新�
 WEATHER_DIR=""       # 物理射线追踪气象数据目录 (.nc 立方体, 可选)
 COREG_MODE="legacy"  # legacy=xcorr+fitoffset (默认); multiscale=多尺度配准 ms_register.py (须显式 --coreg multiscale)
 COREG_USER_SET=false # 命令行是否给了 --coreg (新版电建一号 XML+HDF5 在没给时自动改用 multiscale, 见 discover_data)
+QA_MODE="on"
 INPUT_FORMAT="tiff"  # tiff=旧版 XML+TIFF; h5=新版电建一号 XML+HDF5 (discover_data 里按同名 .h5 识别)
 MS_REGISTER_ARGS="${MS_REGISTER_ARGS:-}"  # 额外传给 ms_register.py register 的参数 (高级用法, 如 "--scales 512,256,128")
 GACOS_PATH=""        # GACOS 数据目录 (.ztd + .rsc)
@@ -152,6 +153,7 @@ PowerChina-1 DInSAR 数据处理脚本 v${SCRIPT_VERSION}
                                         配准后用独立点位复核, 未通过则中止, 不会静默退回 legacy)
                                         额外参数用环境变量 MS_REGISTER_ARGS 传给 ms_register.py register
                                         新版电建一号 (XML+HDF5) 不加此项时自动用 multiscale, 其余数据仍默认 legacy
+  --qa on|off|strict  产品质量检查 (默认 on；strict 时 QA FAIL 会中止流程)
   --crop             仅处理影像中心 50%x50% 区域 (加速验证用)
   --help             显示此帮助
 
@@ -250,6 +252,13 @@ parse_args() {
                     *) error_exit "无效 --coreg: $2 (legacy|multiscale)" ;;
                 esac
                 COREG_USER_SET=true
+                shift 2
+                ;;
+            --qa)
+                case "${2,,}" in
+                    on|off|strict) QA_MODE="${2,,}" ;;
+                    *) error_exit "无效 --qa: $2 (on|off|strict)" ;;
+                esac
                 shift 2
                 ;;
             --help|-h)
@@ -1146,6 +1155,22 @@ run_filter() {
     log_info "滤波完成"
 }
 
+find_snaphu_conf() {
+    local candidate
+    local conf_candidates=(
+        "/usr/local/GMTSAR/share/gmtsar/snaphu/config/snaphu.conf.brief"
+        "$SCRIPT_DIR/gmtsar-master/share/gmtsar/snaphu/config/snaphu.conf.brief"
+        "$SCRIPT_DIR/dinsar_deploy_v2.2_offline/gmtsar-master/share/gmtsar/snaphu/config/snaphu.conf.brief"
+    )
+    for candidate in "${conf_candidates[@]}"; do
+        if [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 run_unwrap() {
     log_step "[5/8] 相位解缠 (模式 $UNWRAP_MODE)..."
     
@@ -1206,17 +1231,7 @@ run_unwrap() {
     # 构建 snaphu 命令 (P0-2: 添加 -s 强制开启 SMOOTH 形变代价模式)
     local snaphu_cmd=("snaphu" "phase.bin" "$ncols" "-o" "unwrap.bin" "-s")
     local snaphu_conf=""
-    local conf_candidates=(
-        "/usr/local/GMTSAR/share/gmtsar/snaphu/config/snaphu.conf.brief"
-        "$SCRIPT_DIR/gmtsar-master/share/gmtsar/snaphu/config/snaphu.conf.brief"
-        "$SCRIPT_DIR/dinsar_deploy_v2.2_offline/gmtsar-master/share/gmtsar/snaphu/config/snaphu.conf.brief"
-    )
-    for c in "${conf_candidates[@]}"; do
-        if [ -f "$c" ]; then
-            snaphu_conf="$c"
-            break
-        fi
-    done
+    snaphu_conf=$(find_snaphu_conf || true)
     if [ -n "$snaphu_conf" ]; then
         snaphu_cmd+=("-f" "$snaphu_conf")
     else
@@ -1830,6 +1845,75 @@ EOF
 #-----------------------------------------------------------------------------
 # 主函数
 #-----------------------------------------------------------------------------
+run_qa() {
+    if [ "$QA_MODE" = "off" ]; then
+        log_info "产品 QA 已关闭 (--qa off)"
+        return 0
+    fi
+
+    local report_dir="$PROJECT_DIR/results/qa"
+    local report_path="$report_dir/qa_report.json"
+    local master_prm="$PROJECT_DIR/SLC/${MASTER_DATE}.PRM"
+    local snaphu_conf
+    local qa_rc
+    local overall=""
+    local qa_tiles="$SNAPHU_TILES"
+    local qa_overlap="$SNAPHU_OVERLAP"
+    if [ "$CROP_MODE" = true ]; then
+        qa_tiles="1 1"
+        qa_overlap=0
+    fi
+    local qa_cmd=(
+        python3 "$SCRIPT_DIR/dinsar_qa.py"
+        --intf-dir "$INTF_DIR"
+        --project-dir "$PROJECT_DIR"
+        --master-prm "$master_prm"
+        --wavelength "$WAVELENGTH"
+        --downsample "$DOWNSAMPLE_FACTOR"
+        --snaphu-tiles "$qa_tiles"
+        --snaphu-overlap "$qa_overlap"
+        --out-dir "$report_dir"
+    )
+
+    mkdir -p "$report_dir" || {
+        if [ "$QA_MODE" = "strict" ]; then
+            error_exit "无法创建 QA 输出目录: $report_dir"
+        fi
+        log_warn "无法创建 QA 输出目录: $report_dir"
+        return 0
+    }
+    snaphu_conf=$(find_snaphu_conf || true)
+    if [ -n "$snaphu_conf" ]; then
+        qa_cmd+=(--snaphu-conf "$snaphu_conf")
+    fi
+    if [ "$QA_MODE" = "strict" ]; then
+        qa_cmd+=(--strict)
+    fi
+
+    log_step "运行产品质量检查 (--qa $QA_MODE)..."
+    if "${qa_cmd[@]}" >> "$LOG_FILE" 2>&1; then
+        qa_rc=0
+    else
+        qa_rc=$?
+    fi
+    if [ -f "$report_path" ]; then
+        overall=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["overall"])' "$report_path" 2>/dev/null)
+    fi
+    if [ -n "$overall" ]; then
+        log_info "QA 总体结论: $overall; 报告: $report_path"
+    else
+        log_warn "QA 未生成有效报告 (rc=$qa_rc); 预期报告: $report_path"
+    fi
+
+    if [ "$QA_MODE" = "strict" ] && { [ "$qa_rc" -ne 0 ] || [ "$overall" = "FAIL" ]; }; then
+        error_exit "严格 QA 未通过; 报告: $report_path" 2
+    fi
+    if [ "$QA_MODE" = "on" ] && { [ "$qa_rc" -ne 0 ] || [ "$overall" = "FAIL" ]; }; then
+        log_warn "产品 QA 未通过，流程继续; 报告: $report_path"
+    fi
+    return 0
+}
+
 main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
@@ -1853,6 +1937,7 @@ main() {
     log_info "配准方式: $COREG_MODE"
     log_info "解缠模式: $UNWRAP_MODE"
     log_info "降采样: ${DOWNSAMPLE_FACTOR}x"
+    log_info "产品 QA: $QA_MODE"
     
     # 检查系统
     check_system || exit 1
@@ -1891,6 +1976,7 @@ main() {
     run_detrend || exit 1
     run_displacement || exit 1
     generate_outputs || exit 1
+    run_qa || exit 1
     
     # 完成
     local end_time=$(date +%s)
