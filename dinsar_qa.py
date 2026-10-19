@@ -457,7 +457,7 @@ def _noisy_width(profile, start, threshold, max_gap):
     band_start = next(
         (
             index
-            for index in range(start, len(profile))
+            for index in range(start, min(start + max_gap + 1, len(profile)))
             if profile[index] is not None and profile[index] > threshold
         ),
         None,

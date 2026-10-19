@@ -184,6 +184,18 @@ class DinsarQASyntheticTests(unittest.TestCase):
         self.assertEqual(right["invalid_width"], 3)
         self.assertAlmostEqual(right["noisy_width"], 15, delta=2)
 
+    def test_interior_noisy_band_is_not_reported_as_edge_noise(self):
+        phase = self.grids["phasefilt.grd"].copy()
+        rng = np.random.default_rng(17)
+        phase[:, 40:55] = rng.uniform(-float(np.pi), float(np.pi), (self.ny, 15))
+        self._write_grid(self.intf_dir / "phasefilt.grd", phase)
+        result, report = self._run_qa()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        edge = self._check(report, "edge_strip")
+        self.assertEqual(edge["status"], "PASS")
+        for widths in edge["value"]["width_pixels"].values():
+            self.assertEqual(widths["noisy_width"], 0)
+
     def test_injected_tile_seam_is_flagged(self):
         unwrap = self.grids["unwrap.grd"].copy()
         unwrap[self.ny // 2 :, :] += np.float32(2.0 * np.pi)
