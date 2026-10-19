@@ -11,6 +11,8 @@ from pathlib import Path
 
 import numpy as np
 
+import dinsar_qa
+
 
 SHIFT_KEYS = ("rshift", "ashift", "stretch_r", "a_stretch_r", "stretch_a", "a_stretch_a")
 SUBPIXEL_KEYS = ("sub_int_r", "sub_int_a")
@@ -137,11 +139,15 @@ def build_mask(
     out_mask,
     summary_json=None,
     master_prm=None,
+    phase_grid=None,
+    edge_noise="on",
 ):
     if not math.isfinite(corr_thresh) or not 0.0 <= corr_thresh < 1.0:
         raise ValueError("--corr-thresh must be in [0, 1)")
     if margin_px < 0:
         raise ValueError("--margin-px must be non-negative")
+    if edge_noise not in ("on", "off"):
+        raise ValueError("--edge-noise must be on or off")
 
     transform, subpixel_defaults = _read_prm(slave_prm, SHIFT_KEYS)
     slave_size, _ = _read_prm(slave_size_prm, ("num_rng_bins", "num_lines"))
@@ -190,13 +196,46 @@ def build_mask(
             & (ys <= slave_ny - 1 - margin_px)
         )
     corr_ok = np.ones(corr.shape, dtype=bool) if corr_thresh == 0.0 else np.isfinite(corr) & (corr >= corr_thresh)
-    valid = overlap_ok & corr_ok
+    edge_noise_widths = {edge: 0 for edge in ("top", "bottom", "left", "right")}
+    edge_noise_pixels = np.zeros(corr.shape, dtype=bool)
+    if edge_noise == "on":
+        if not phase_grid:
+            raise ValueError("--phase-grid is required when --edge-noise is on")
+        phase = dinsar_qa._read_grid(phase_grid)
+        if phase.shape != corr.shape:
+            raise ValueError(f"phase grid shape {phase.shape} does not match coherence grid {corr.shape}")
+        _, residue_mask, valid_loops = dinsar_qa._residue_metrics(phase, corr)
+        edge_check = dinsar_qa._edge_strip_check(residue_mask, valid_loops, phase)
+        edge_widths = edge_check["value"]["width_pixels"]
+        edge_starts = edge_check["value"]["noisy_band_start_offset"]
+        ny, nx = corr.shape
+        for edge in edge_noise_widths:
+            width = int(edge_widths[edge]["noisy_width"])
+            start = edge_starts[edge]
+            edge_noise_widths[edge] = width
+            if width < 1 or start is None:
+                continue
+            start = int(start)
+            if edge == "top":
+                edge_noise_pixels[start : start + width, :] = True
+            elif edge == "bottom":
+                edge_noise_pixels[ny - start - width : ny - start, :] = True
+            elif edge == "left":
+                edge_noise_pixels[:, start : start + width] = True
+            else:
+                edge_noise_pixels[:, nx - start - width : nx - start] = True
+
+    base_valid = overlap_ok & corr_ok
+    newly_masked = base_valid & edge_noise_pixels
+    valid = base_valid & ~edge_noise_pixels
     mask = np.where(valid, 1.0, np.nan).astype(np.float32)
     _write_grid(out_mask, mask, grid)
 
     total = int(mask.size)
     overlap_masked = int(np.count_nonzero(~overlap_ok))
     corr_masked = int(np.count_nonzero(overlap_ok & ~corr_ok))
+    edge_noise_masked = int(np.count_nonzero(newly_masked))
+    edge_noise_fraction = edge_noise_masked / total
     summary = {
         "grid": {
             **grid,
@@ -217,6 +256,11 @@ def build_mask(
             "corr_below_threshold_fraction": float(np.count_nonzero(~corr_ok) / total),
         },
         "overlap_invalid_widths_px": _edge_widths(overlap_ok),
+        "edge_noise_enabled": edge_noise == "on",
+        "edge_noise_widths_px": edge_noise_widths,
+        "edge_noise_mask_fraction": float(edge_noise_fraction),
+        "edge_noise_masked_pixels": edge_noise_masked,
+        "phase_grid": str(Path(phase_grid)) if phase_grid else None,
         "edge_width_invalid_line_fraction_min": 0.9,
         "output_mask": str(Path(out_mask)),
     }
@@ -235,6 +279,11 @@ def main(argv=None):
     parser.add_argument("--master-prm", help="master PRM; supplies the top-down line origin for cropped grids")
     parser.add_argument("--corr-thresh", type=float, default=0.3)
     parser.add_argument("--margin-px", type=int, default=4)
+    parser.add_argument("--phase-grid", help="filtered phase grid used by the QA edge-residual detector")
+    parser.add_argument(
+        "--edge-noise", choices=("on", "off"), default="on",
+        help="mask edge residual-noise bands detected by dinsar_qa (default: on)",
+    )
     parser.add_argument("--out-mask", required=True)
     parser.add_argument("--summary-json")
     args = parser.parse_args(argv)
@@ -248,6 +297,8 @@ def main(argv=None):
             args.out_mask,
             args.summary_json,
             args.master_prm,
+            args.phase_grid,
+            args.edge_noise,
         )
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"product_mask.py: {exc}", file=sys.stderr)

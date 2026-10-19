@@ -65,6 +65,7 @@ COREG_MODE="legacy"  # legacy=xcorr+fitoffset (默认); multiscale=多尺度配�
 COREG_USER_SET=false # 命令行是否给了 --coreg (新版电建一号 XML+HDF5 在没给时自动改用 multiscale, 见 discover_data)
 QA_MODE="on"
 MASK_CORR="0.3"
+MASK_EDGE_NOISE="on"
 INPUT_FORMAT="tiff"  # tiff=旧版 XML+TIFF; h5=新版电建一号 XML+HDF5 (discover_data 里按同名 .h5 识别)
 MS_REGISTER_ARGS="${MS_REGISTER_ARGS:-}"  # 额外传给 ms_register.py register 的参数 (高级用法, 如 "--scales 512,256,128")
 GACOS_PATH=""        # GACOS 数据目录 (.ztd + .rsc)
@@ -161,6 +162,7 @@ PowerChina-1 DInSAR 数据处理脚本 v${SCRIPT_VERSION}
                                         新版电建一号 (XML+HDF5) 不加此项时自动用 multiscale, 其余数据仍默认 legacy
   --qa on|off|strict  产品质量检查 (默认 on；strict 时 QA FAIL 会中止流程)
   --mask-corr T      掩膜低相干区域 (默认 0.3；0 表示不按相干性掩膜)
+  --mask-edge-noise on|off  掩膜 QA 检测到的边缘残差噪声带 (默认 on)
   --snaphu-conf auto|base|<path>
                                         SNAPHU 配置: auto (默认, 按 PRM 派生) / base (旧配置) / 指定文件
   --snaphu-overlap N                   SNAPHU 分块重叠像元数 (正整数, 默认由处理模式决定)
@@ -278,6 +280,14 @@ parse_args() {
                     error_exit "无效 --mask-corr: $2 (必须是 [0,1) 范围内的数字)"
                 fi
                 MASK_CORR="$2"
+                shift 2
+                ;;
+            --mask-edge-noise)
+                [ "$#" -ge 2 ] || error_exit "--mask-edge-noise 需要 on 或 off"
+                case "${2,,}" in
+                    on|off) MASK_EDGE_NOISE="${2,,}" ;;
+                    *) error_exit "无效 --mask-edge-noise: $2 (on|off)" ;;
+                esac
                 shift 2
                 ;;
             --snaphu-conf)
@@ -1751,17 +1761,26 @@ run_product_mask() {
     if [ "$CROP_MODE" = true ] && [ -f "$INTF_DIR/corr_crop.grd" ]; then
         mask_corr_grid="$INTF_DIR/corr_crop.grd"
     fi
+    local mask_phase_grid="$INTF_DIR/phasefilt.grd"
+    if [ "$CROP_MODE" = true ] && [ -f "$INTF_DIR/phasefilt_crop.grd" ]; then
+        mask_phase_grid="$INTF_DIR/phasefilt_crop.grd"
+    fi
     [ -f "$slave_prm" ] || error_exit "掩膜生成缺少配准 PRM: $slave_prm"
     [ -f "$mask_corr_grid" ] || error_exit "掩膜生成缺少相关性网格: $mask_corr_grid"
     [ -f "$master_prm" ] || error_exit "掩膜生成缺少主影像 PRM: $master_prm"
+    if [ "$MASK_EDGE_NOISE" = "on" ] && [ ! -f "$mask_phase_grid" ]; then
+        error_exit "边缘噪声掩膜缺少滤波相位网格: $mask_phase_grid"
+    fi
 
-    log_step "构建影像覆盖与相干性产品掩膜 (--mask-corr $MASK_CORR)..."
+    log_step "构建影像覆盖、相干性与边缘噪声产品掩膜 (--mask-corr $MASK_CORR --mask-edge-noise $MASK_EDGE_NOISE)..."
     python3 "$SCRIPT_DIR/product_mask.py" \
         --grid "$mask_corr_grid" \
+        --phase-grid "$mask_phase_grid" \
         --slave-prm "$slave_prm" \
         --slave-size-prm "$slave_size_prm" \
         --master-prm "$master_prm" \
         --corr-thresh "$MASK_CORR" \
+        --edge-noise "$MASK_EDGE_NOISE" \
         --margin-px 4 \
         --out-mask "$INTF_DIR/product_mask.grd" \
         --summary-json "$INTF_DIR/product_mask_summary.json" >> "$LOG_FILE" 2>&1 ||
@@ -1773,7 +1792,7 @@ run_product_mask() {
     [ -f "$INTF_DIR/los_displacement_masked.grd" ] || error_exit "未生成掩膜 LOS 位移网格"
 
     local mask_fractions
-    mask_fractions=$(python3 -c 'import json,sys; f=json.load(open(sys.argv[1]))["fractions"]; print("overlap=%.2f%% corr=%.2f%% total=%.2f%%" % (100*f["masked_fraction_by_overlap"], 100*f["masked_fraction_by_corr"], 100*f["masked_fraction_total"]))' \
+    mask_fractions=$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); f=s["fractions"]; print("overlap=%.2f%% corr=%.2f%% edge-noise=%.2f%% total=%.2f%%" % (100*f["masked_fraction_by_overlap"], 100*f["masked_fraction_by_corr"], 100*s["edge_noise_mask_fraction"], 100*f["masked_fraction_total"]))' \
         "$INTF_DIR/product_mask_summary.json")
     log_info "产品掩膜统计: $mask_fractions"
 }

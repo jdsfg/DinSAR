@@ -31,19 +31,24 @@ class ProductMaskTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.grid = self.root / "corr.grd"
+        self.phase_grid = self.root / "phasefilt.grd"
         self.slave_prm = self.root / "slave_shift.PRM"
         self.size_prm = self.root / "slave_size.PRM"
         self.out_mask = self.root / "mask.grd"
         self.summary_path = self.root / "summary.json"
         self.corr = np.ones((self.ny, self.nx), dtype=np.float32)
+        y, x = np.mgrid[0:self.ny, 0:self.nx].astype(np.float32)
+        self.phase = 0.01 * x + 0.02 * y
         self._write_grid(self.corr)
+        self._write_grid(self.phase, self.phase_grid)
         self._write_prms()
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def _write_grid(self, values):
-        xyz = self.root / "corr.xyz"
+    def _write_grid(self, values, grid_path=None):
+        grid_path = grid_path or self.grid
+        xyz = self.root / f"{Path(grid_path).stem}.xyz"
         with xyz.open("w", encoding="utf-8") as stream:
             for row in range(self.ny):
                 y = self.y_max - (row + 0.5) * self.dy
@@ -58,7 +63,7 @@ class ProductMaskTests(unittest.TestCase):
                 f"-R0/{self.x_max}/0/{self.y_max}",
                 f"-I{self.dx}/{self.dy}",
                 "-r",
-                f"-G{self.grid}",
+                f"-G{grid_path}",
             ],
             capture_output=True,
             text=True,
@@ -88,12 +93,16 @@ class ProductMaskTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def _run(self, corr_thresh=0.3, margin_px=4):
+    def _run(self, corr_thresh=0.3, margin_px=4, edge_noise="on"):
         command = [
             sys.executable,
             str(SCRIPT),
             "--grid",
             str(self.grid),
+            "--phase-grid",
+            str(self.phase_grid),
+            "--edge-noise",
+            edge_noise,
             "--slave-prm",
             str(self.slave_prm),
             "--slave-size-prm",
@@ -165,6 +174,30 @@ class ProductMaskTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(mask[:, :5])))
         self.assertAlmostEqual(summary["fractions"]["masked_fraction_by_corr"], 1 / 20)
 
+    def test_edge_noise_masks_detected_bottom_band_when_enabled(self):
+        rng = np.random.default_rng(37)
+        phase = self.phase.copy()
+        phase[-9:-3, :] = rng.uniform(-float(np.pi), float(np.pi), (6, self.nx))
+        phase[-3:, :] = 0.0
+        self._write_grid(phase, self.phase_grid)
+        result, mask, summary = self._run(margin_px=0, edge_noise="on")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(summary["edge_noise_widths_px"]["bottom"], 0)
+        self.assertGreater(summary["edge_noise_mask_fraction"], 0.0)
+        self.assertTrue(np.all(~np.isfinite(mask[-9:-3, :])))
+
+    def test_edge_noise_off_leaves_detected_bottom_band_unmasked(self):
+        rng = np.random.default_rng(37)
+        phase = self.phase.copy()
+        phase[-9:-3, :] = rng.uniform(-float(np.pi), float(np.pi), (6, self.nx))
+        phase[-3:, :] = 0.0
+        self._write_grid(phase, self.phase_grid)
+        result, mask, summary = self._run(margin_px=0, edge_noise="off")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(np.all(np.isfinite(mask[-18:-3, :])))
+        self.assertEqual(summary["edge_noise_widths_px"]["bottom"], 0)
+        self.assertEqual(summary["edge_noise_mask_fraction"], 0.0)
+
     def test_zero_threshold_disables_coherence_mask(self):
         self.corr[:, 5] = 0.2
         self._write_grid(self.corr)
@@ -214,6 +247,16 @@ class RunDinsarMaskCorrOptionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "0.3")
 
+    def test_default_edge_noise_is_on(self):
+        result = subprocess.run(
+            ["bash", "-c", "source ./run_dinsar.sh; printf '%s' \"$MASK_EDGE_NOISE\""],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "on")
+
     def test_valid_mask_thresholds_parse(self):
         for threshold in ("0", ".25", "0.3", "0.999", "1e-3"):
             with self.subTest(threshold=threshold):
@@ -228,6 +271,37 @@ class RunDinsarMaskCorrOptionTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("无效 --mask-corr", result.stdout + result.stderr)
 
+    def test_valid_edge_noise_values_parse(self):
+        for value in ("on", "off", "OFF"):
+            with self.subTest(value=value):
+                command = (
+                    "source ./run_dinsar.sh; LOG_FILE=/dev/null; "
+                    f"parse_args --mask-edge-noise {value} /tmp; "
+                    "printf '%s' \"$MASK_EDGE_NOISE\""
+                )
+                result = subprocess.run(
+                    ["bash", "-c", command],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, value.lower())
+
+    def test_invalid_edge_noise_value_is_rejected(self):
+        command = (
+            "source ./run_dinsar.sh; LOG_FILE=/dev/null; "
+            "parse_args --mask-edge-noise maybe /tmp"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("无效 --mask-edge-noise", result.stdout + result.stderr)
+
     def test_help_mentions_mask_flag(self):
         result = subprocess.run(
             ["bash", str(RUN_DINSAR), "--help"],
@@ -237,6 +311,7 @@ class RunDinsarMaskCorrOptionTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--mask-corr T", result.stdout)
+        self.assertIn("--mask-edge-noise on|off", result.stdout)
 
 
 if __name__ == "__main__":
