@@ -165,6 +165,24 @@ class DinsarQASyntheticTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self._check(report, "congruence")["status"], "PASS")
         self.assertEqual(self._check(report, "unwrap_discontinuity")["status"], "PASS")
+        edge = self._check(report, "edge_strip")
+        self.assertEqual(edge["status"], "PASS")
+        for widths in edge["value"]["width_pixels"].values():
+            self.assertEqual(widths, {"invalid_width": 0, "noisy_width": 0})
+
+    def test_zero_filled_and_noisy_edge_band_is_detected(self):
+        phase = self.grids["phasefilt.grd"].copy()
+        rng = np.random.default_rng(13)
+        phase[:, -18:-3] = rng.uniform(-float(np.pi), float(np.pi), (self.ny, 15))
+        phase[:, -3:] = 0.0
+        self._write_grid(self.intf_dir / "phasefilt.grd", phase)
+        result, report = self._run_qa()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        edge = self._check(report, "edge_strip")
+        self.assertEqual(edge["status"], "WARN")
+        right = edge["value"]["width_pixels"]["right"]
+        self.assertEqual(right["invalid_width"], 3)
+        self.assertAlmostEqual(right["noisy_width"], 15, delta=2)
 
     def test_injected_tile_seam_is_flagged(self):
         unwrap = self.grids["unwrap.grd"].copy()

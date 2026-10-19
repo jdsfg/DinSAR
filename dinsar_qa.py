@@ -39,7 +39,9 @@ THRESHOLDS = {
         "reference_count": 20,
     },
     "edge_strip": {
-        "residue_density_above": 0.3,
+        "invalid_line_fraction_min": 0.9,
+        "residue_density_above": 0.2,
+        "noisy_gap_tolerance_lines": 2,
         "warn_width_fraction_above": 0.01,
     },
     "dem": {
@@ -445,14 +447,40 @@ def _tile_seam_check(unwrap, tiles, overlap):
 def _edge_width(profile, threshold):
     width = 0
     for value in profile:
-        if value is None or value <= threshold:
+        if value is None or value < threshold:
             break
         width += 1
     return width
 
 
-def _edge_strip_check(residue_mask, valid_loops):
-    threshold = THRESHOLDS["edge_strip"]["residue_density_above"]
+def _noisy_width(profile, start, threshold, max_gap):
+    band_start = next(
+        (
+            index
+            for index in range(start, len(profile))
+            if profile[index] is not None and profile[index] > threshold
+        ),
+        None,
+    )
+    if band_start is None:
+        return 0
+
+    width = 0
+    gap = 0
+    for value in profile[band_start:]:
+        if value is not None and value > threshold:
+            width += gap + 1
+            gap = 0
+        else:
+            gap += 1
+            if gap > max_gap:
+                break
+    return width
+
+
+def _edge_strip_check(residue_mask, valid_loops, phasefilt):
+    thresholds = THRESHOLDS["edge_strip"]
+    density_threshold = thresholds["residue_density_above"]
 
     def density_by_axis(axis):
         total = np.count_nonzero(valid_loops, axis=axis)
@@ -465,13 +493,16 @@ def _edge_strip_check(residue_mask, valid_loops):
         )
         return [float(value) if np.isfinite(value) else None for value in values]
 
+    invalid = ~np.isfinite(phasefilt) | (phasefilt == 0.0)
+    row_invalid_fraction = np.mean(invalid, axis=1).tolist()
+    column_invalid_fraction = np.mean(invalid, axis=0).tolist()
     row_density = density_by_axis(1)
     column_density = density_by_axis(0)
-    widths = {
-        "top": _edge_width(row_density, threshold),
-        "bottom": _edge_width(row_density[::-1], threshold),
-        "left": _edge_width(column_density, threshold),
-        "right": _edge_width(column_density[::-1], threshold),
+    profiles = {
+        "top": (row_density, row_invalid_fraction),
+        "bottom": (row_density[::-1], row_invalid_fraction[::-1]),
+        "left": (column_density, column_invalid_fraction),
+        "right": (column_density[::-1], column_invalid_fraction[::-1]),
     }
     dimensions = {
         "top": residue_mask.shape[0],
@@ -479,11 +510,29 @@ def _edge_strip_check(residue_mask, valid_loops):
         "left": residue_mask.shape[1],
         "right": residue_mask.shape[1],
     }
-    fractions = {edge: widths[edge] / dimensions[edge] if dimensions[edge] else 0.0 for edge in widths}
-    maximum = max(fractions.values()) if fractions else 0.0
+    widths = {}
+    fractions = {}
+    for edge, (density_profile, invalid_profile) in profiles.items():
+        invalid_width = _edge_width(invalid_profile, thresholds["invalid_line_fraction_min"])
+        noisy_width = _noisy_width(
+            density_profile,
+            invalid_width,
+            density_threshold,
+            thresholds["noisy_gap_tolerance_lines"],
+        )
+        dimension = dimensions[edge]
+        widths[edge] = {
+            "invalid_width": invalid_width,
+            "noisy_width": noisy_width,
+        }
+        fractions[edge] = {
+            "invalid_fraction": invalid_width / dimension if dimension else 0.0,
+            "noisy_fraction": noisy_width / dimension if dimension else 0.0,
+        }
+    maximum = max((item["noisy_fraction"] for item in fractions.values()), default=0.0)
     status = (
         "WARN"
-        if maximum > THRESHOLDS["edge_strip"]["warn_width_fraction_above"]
+        if maximum > thresholds["warn_width_fraction_above"]
         else "PASS"
     )
     return _check(
@@ -491,11 +540,13 @@ def _edge_strip_check(residue_mask, valid_loops):
         "边缘残差带",
         {"width_pixels": widths, "width_fraction": fractions},
         {
-            "residue_density_above": threshold,
-            "warn_width_fraction_above": THRESHOLDS["edge_strip"]["warn_width_fraction_above"],
+            "invalid_line_fraction_min": thresholds["invalid_line_fraction_min"],
+            "residue_density_above": density_threshold,
+            "noisy_gap_tolerance_lines": thresholds["noisy_gap_tolerance_lines"],
+            "warn_width_fraction_above": thresholds["warn_width_fraction_above"],
         },
         status,
-        "边缘向内连续统计残差点密度超过阈值的带宽。",
+        "记录边缘零值或无效填充带宽（本身不触发告警）；远/近距向噪声带通常表示从影像在该范围无重叠（可能由距离向偏移造成），应予掩膜。",
     )
 
 
@@ -934,7 +985,7 @@ def _run(args):
     discontinuity_check, bad_pixels = _unwrap_discontinuity_check(grids["unwrap"], grids["corr"])
     checks.append(discontinuity_check)
     checks.append(_tile_seam_check(grids["unwrap"], tiles, args.snaphu_overlap))
-    checks.append(_edge_strip_check(residue_mask, valid_loops))
+    checks.append(_edge_strip_check(residue_mask, valid_loops, grids["phase"]))
     ramp = _read_grid(project_dir / "debug" / "orbital_ramp.grd")
     checks.append(_detrend_check(ramp, grids["unwrap"], grids["detrended"], grids["corr"], wavelength))
     del ramp
