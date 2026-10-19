@@ -197,6 +197,7 @@ def build_mask(
         )
     corr_ok = np.ones(corr.shape, dtype=bool) if corr_thresh == 0.0 else np.isfinite(corr) & (corr >= corr_thresh)
     edge_noise_widths = {edge: 0 for edge in ("top", "bottom", "left", "right")}
+    edge_noise_extents = {edge: 0 for edge in ("top", "bottom", "left", "right")}
     edge_noise_pixels = np.zeros(corr.shape, dtype=bool)
     if edge_noise == "on":
         if not phase_grid:
@@ -215,15 +216,16 @@ def build_mask(
             edge_noise_widths[edge] = width
             if width < 1 or start is None:
                 continue
-            start = int(start)
+            extent = int(start) + width
+            edge_noise_extents[edge] = extent
             if edge == "top":
-                edge_noise_pixels[start : start + width, :] = True
+                edge_noise_pixels[:extent, :] = True
             elif edge == "bottom":
-                edge_noise_pixels[ny - start - width : ny - start, :] = True
+                edge_noise_pixels[ny - extent :, :] = True
             elif edge == "left":
-                edge_noise_pixels[:, start : start + width] = True
+                edge_noise_pixels[:, :extent] = True
             else:
-                edge_noise_pixels[:, nx - start - width : nx - start] = True
+                edge_noise_pixels[:, nx - extent :] = True
 
     base_valid = overlap_ok & corr_ok
     newly_masked = base_valid & edge_noise_pixels
@@ -258,6 +260,7 @@ def build_mask(
         "overlap_invalid_widths_px": _edge_widths(overlap_ok),
         "edge_noise_enabled": edge_noise == "on",
         "edge_noise_widths_px": edge_noise_widths,
+        "edge_noise_masked_extent_px": edge_noise_extents,
         "edge_noise_mask_fraction": float(edge_noise_fraction),
         "edge_noise_masked_pixels": edge_noise_masked,
         "phase_grid": str(Path(phase_grid)) if phase_grid else None,

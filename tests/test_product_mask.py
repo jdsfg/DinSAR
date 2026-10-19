@@ -186,6 +186,17 @@ class ProductMaskTests(unittest.TestCase):
         self.assertGreater(summary["edge_noise_mask_fraction"], 0.0)
         self.assertTrue(np.all(~np.isfinite(mask[-9:-3, :])))
 
+    def test_edge_noise_masks_from_boundary_through_band(self):
+        rng = np.random.default_rng(37)
+        phase = self.phase.copy()
+        phase[-9:-3, :] = rng.uniform(-float(np.pi), float(np.pi), (6, self.nx))
+        phase[-3:, :] = 0.0
+        self._write_grid(phase, self.phase_grid)
+        result, mask, summary = self._run(margin_px=0, edge_noise="on")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(summary["edge_noise_masked_extent_px"]["bottom"], 9)
+        self.assertTrue(np.all(~np.isfinite(mask[-3:, :])))
+
     def test_edge_noise_off_leaves_detected_bottom_band_unmasked(self):
         rng = np.random.default_rng(37)
         phase = self.phase.copy()
