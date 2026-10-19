@@ -1300,8 +1300,8 @@ run_unwrap() {
         gmt grd2xyz corr_no_nan.grd -ZTLf > corr.bin 2>> "$LOG_FILE"
     fi
     
-    # 构建 snaphu 命令 (P0-2: 添加 -s 强制开启 SMOOTH 形变代价模式)
-    local snaphu_cmd=("snaphu" "phase.bin" "$ncols" "-o" "unwrap.bin" "-s")
+    # 构建 snaphu 命令 (P0-2: 使用 DEFO 形变代价模式)
+    local snaphu_cmd=("snaphu" "phase.bin" "$ncols" "-o" "unwrap.bin")
     if [ -n "$SNAPHU_CONF_USED" ]; then
         snaphu_cmd+=("-f" "$SNAPHU_CONF_USED")
     else
