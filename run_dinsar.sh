@@ -84,7 +84,12 @@ CROP_MODE=false
 
 SNAPHU_TILES="2 2"
 SNAPHU_OVERLAP="200"
+SNAPHU_OVERLAP_USER_SET=false
 SNAPHU_NPROC=8
+SNAPHU_CONF_MODE="auto"
+SNAPHU_CONF_PATH=""
+SNAPHU_CONF_USED=""
+CORR_FILTER_WIDTH=20
 
 # grdtrend 的 -N: 1 = 只减去均值 (不去倾斜), 3 = 平面, 4 = 双线性, 6 = 二次曲面。
 # 环境变量 DETREND_ORDER 明确指定的值优先于新版数据的自动选择 (见 discover_data)。
@@ -154,6 +159,9 @@ PowerChina-1 DInSAR 数据处理脚本 v${SCRIPT_VERSION}
                                         额外参数用环境变量 MS_REGISTER_ARGS 传给 ms_register.py register
                                         新版电建一号 (XML+HDF5) 不加此项时自动用 multiscale, 其余数据仍默认 legacy
   --qa on|off|strict  产品质量检查 (默认 on；strict 时 QA FAIL 会中止流程)
+  --snaphu-conf auto|base|<path>
+                                        SNAPHU 配置: auto (默认, 按 PRM 派生) / base (旧配置) / 指定文件
+  --snaphu-overlap N                   SNAPHU 分块重叠像元数 (正整数, 默认由处理模式决定)
   --crop             仅处理影像中心 50%x50% 区域 (加速验证用)
   --help             显示此帮助
 
@@ -261,6 +269,34 @@ parse_args() {
                 esac
                 shift 2
                 ;;
+            --snaphu-conf)
+                [ "$#" -ge 2 ] || error_exit "--snaphu-conf 需要 auto|base|<path>"
+                case "${2,,}" in
+                    auto|base)
+                        SNAPHU_CONF_MODE="${2,,}"
+                        SNAPHU_CONF_PATH=""
+                        ;;
+                    *)
+                        SNAPHU_CONF_MODE="path"
+                        if [[ "$2" = /* ]]; then
+                            SNAPHU_CONF_PATH="$2"
+                        else
+                            local conf_dir
+                            conf_dir=$(cd "$(dirname "$2")" 2>/dev/null && pwd) ||
+                                error_exit "无效的 SNAPHU 配置路径: $2"
+                            SNAPHU_CONF_PATH="$conf_dir/$(basename "$2")"
+                        fi
+                        ;;
+                esac
+                shift 2
+                ;;
+            --snaphu-overlap)
+                [ "$#" -ge 2 ] && [[ "$2" =~ ^[1-9][0-9]*$ ]] ||
+                    error_exit "无效 --snaphu-overlap: ${2:-} (必须为正整数)"
+                SNAPHU_OVERLAP="$2"
+                SNAPHU_OVERLAP_USER_SET=true
+                shift 2
+                ;;
             --help|-h)
                 show_help
                 ;;
@@ -305,7 +341,7 @@ apply_tier_defaults() {
             UNWRAP_MODE="B"
             default_downsample=8
             SNAPHU_TILES="3 3"
-            SNAPHU_OVERLAP="250"
+            [ "$SNAPHU_OVERLAP_USER_SET" = true ] || SNAPHU_OVERLAP="250"
             SNAPHU_NPROC=4
             ;;
         *)
@@ -1139,12 +1175,12 @@ run_filter() {
         # 核心优化3：重构真实物理相干性评估 (Pearson Correlation)
         log_info "计算基于空间包络滤波的真实干涉相干性 (Pearson Correlation)..."
         # 1. 对复数干涉图的实部和虚部进行空间平滑，计算分子强度
-        gmt grdfilter "$REAL_FILE" -Fg20/20 -D0 -Greal_mean.grd >> "$LOG_FILE" 2>&1
-        gmt grdfilter "$IMAG_FILE" -Fg20/20 -D0 -Gimag_mean.grd >> "$LOG_FILE" 2>&1
+        gmt grdfilter "$REAL_FILE" -Fg${CORR_FILTER_WIDTH}/${CORR_FILTER_WIDTH} -D0 -Greal_mean.grd >> "$LOG_FILE" 2>&1
+        gmt grdfilter "$IMAG_FILE" -Fg${CORR_FILTER_WIDTH}/${CORR_FILTER_WIDTH} -D0 -Gimag_mean.grd >> "$LOG_FILE" 2>&1
         gmt grdmath real_mean.grd imag_mean.grd HYPOT = num_amp.grd
         # 2. 对复数干涉图的绝对振幅进行空间平滑，计算分母
         gmt grdmath "$REAL_FILE" "$IMAG_FILE" HYPOT = raw_amp.grd
-        gmt grdfilter raw_amp.grd -Fg20/20 -D0 -Gden_amp.grd >> "$LOG_FILE" 2>&1
+        gmt grdfilter raw_amp.grd -Fg${CORR_FILTER_WIDTH}/${CORR_FILTER_WIDTH} -D0 -Gden_amp.grd >> "$LOG_FILE" 2>&1
         # 3. 计算相干系数 (防止除零，并将上限截断到 1.0，安全替换 NaN 为 0)
         gmt grdmath num_amp.grd den_amp.grd DIV 1.0 MIN 0 AND = corr.grd
     else
@@ -1175,6 +1211,42 @@ run_unwrap() {
     log_step "[5/8] 相位解缠 (模式 $UNWRAP_MODE)..."
     
     cd "$INTF_DIR" || error_exit "无法进入干涉目录"
+
+    case "$SNAPHU_CONF_MODE" in
+        auto)
+            local base_conf master_prm conf_summary
+            base_conf=$(find_snaphu_conf) || error_exit "未找到 snaphu.conf.brief，无法生成自动配置"
+            master_prm="$PROJECT_DIR/SLC/${MASTER_DATE}.PRM"
+            [ -f "$master_prm" ] || error_exit "自动 SNAPHU 配置缺少主影像 PRM: $master_prm"
+            SNAPHU_CONF_USED="$INTF_DIR/snaphu_auto.conf"
+            conf_summary=$(python3 "$SCRIPT_DIR/snaphu_conf_gen.py" \
+                --base "$base_conf" \
+                --prm "$master_prm" \
+                --downsample "$DOWNSAMPLE_FACTOR" \
+                --corr-filter-width "$CORR_FILTER_WIDTH" \
+                --out "$SNAPHU_CONF_USED" 2>&1) ||
+                error_exit "SNAPHU 自动配置生成失败: $conf_summary"
+            log_info "SNAPHU 配置(auto): $SNAPHU_CONF_USED"
+            log_info "SNAPHU 派生参数: $conf_summary"
+            ;;
+        base)
+            SNAPHU_CONF_USED=$(find_snaphu_conf || true)
+            if [ -n "$SNAPHU_CONF_USED" ]; then
+                log_info "SNAPHU 配置(base): $SNAPHU_CONF_USED"
+            else
+                log_warn "未找到 snaphu.conf.brief，使用 snaphu 默认配置"
+            fi
+            ;;
+        path)
+            SNAPHU_CONF_USED="$SNAPHU_CONF_PATH"
+            [ -n "$SNAPHU_CONF_USED" ] && [ -r "$SNAPHU_CONF_USED" ] ||
+                error_exit "SNAPHU 配置不可读: ${SNAPHU_CONF_USED:-<empty>}"
+            log_info "SNAPHU 配置(path): $SNAPHU_CONF_USED"
+            ;;
+        *)
+            error_exit "未知 SNAPHU 配置模式: $SNAPHU_CONF_MODE"
+            ;;
+    esac
 
     # 解缠恢复：若已存在 unwrap.grd 则跳过解缠，便于中断后从去趋势步骤继续
     if [ -f unwrap.grd ]; then
@@ -1230,12 +1302,10 @@ run_unwrap() {
     
     # 构建 snaphu 命令 (P0-2: 添加 -s 强制开启 SMOOTH 形变代价模式)
     local snaphu_cmd=("snaphu" "phase.bin" "$ncols" "-o" "unwrap.bin" "-s")
-    local snaphu_conf=""
-    snaphu_conf=$(find_snaphu_conf || true)
-    if [ -n "$snaphu_conf" ]; then
-        snaphu_cmd+=("-f" "$snaphu_conf")
+    if [ -n "$SNAPHU_CONF_USED" ]; then
+        snaphu_cmd+=("-f" "$SNAPHU_CONF_USED")
     else
-        log_warn "未找到 snaphu.conf.brief，使用 snaphu 默认配置"
+        log_warn "SNAPHU 配置未设置，使用 snaphu 默认配置"
     fi
     
     if [ "$UNWRAP_MODE" = "A" ]; then
@@ -1854,7 +1924,6 @@ run_qa() {
     local report_dir="$PROJECT_DIR/results/qa"
     local report_path="$report_dir/qa_report.json"
     local master_prm="$PROJECT_DIR/SLC/${MASTER_DATE}.PRM"
-    local snaphu_conf
     local qa_rc
     local overall=""
     local qa_tiles="$SNAPHU_TILES"
@@ -1882,9 +1951,8 @@ run_qa() {
         log_warn "无法创建 QA 输出目录: $report_dir"
         return 0
     }
-    snaphu_conf=$(find_snaphu_conf || true)
-    if [ -n "$snaphu_conf" ]; then
-        qa_cmd+=(--snaphu-conf "$snaphu_conf")
+    if [ -n "$SNAPHU_CONF_USED" ]; then
+        qa_cmd+=(--snaphu-conf "$SNAPHU_CONF_USED")
     fi
     if [ "$QA_MODE" = "strict" ]; then
         qa_cmd+=(--strict)
