@@ -1076,6 +1076,28 @@ def _run(args):
     checks.append(edge_check)
     product_mask_check = _product_mask_check(intf_dir, shape, edge_check)
     if product_mask_check is not None:
+        coverage = product_mask_check["value"]["noisy_band_coverage_by_edge"]
+        mask_coverage_pct = {
+            edge: (
+                100.0 * coverage[edge]["masked_fraction"]
+                if coverage[edge]["masked_fraction"] is not None
+                else None
+            )
+            for edge in ("top", "bottom", "left", "right")
+        }
+        edge_check["value"]["mask_coverage_pct"] = mask_coverage_pct
+        noisy_edges = [
+            edge
+            for edge in ("top", "bottom", "left", "right")
+            if edge_check["value"]["width_pixels"][edge]["noisy_width"] > 0
+        ]
+        if noisy_edges:
+            covered = all(
+                mask_coverage_pct[edge] is not None and mask_coverage_pct[edge] >= 99.0
+                for edge in noisy_edges
+            )
+            edge_check["status"] = "PASS" if covered else "WARN"
+            edge_check["note_zh"] = "已被产品掩膜覆盖" if covered else "边缘残差噪声带未被产品掩膜充分覆盖。"
         checks.append(product_mask_check)
     ramp = _read_grid(project_dir / "debug" / "orbital_ramp.grd")
     checks.append(_detrend_check(ramp, grids["unwrap"], grids["detrended"], grids["corr"], wavelength))

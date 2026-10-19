@@ -180,6 +180,7 @@ class DinsarQASyntheticTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         edge = self._check(report, "edge_strip")
         self.assertEqual(edge["status"], "WARN")
+        self.assertNotIn("mask_coverage_pct", edge["value"])
         right = edge["value"]["width_pixels"]["right"]
         self.assertEqual(right["invalid_width"], 3)
         self.assertAlmostEqual(right["noisy_width"], 15, delta=2)
@@ -216,6 +217,27 @@ class DinsarQASyntheticTests(unittest.TestCase):
             product_mask["value"]["noisy_band_coverage_by_edge"]["right"]["masked_fraction"],
             1.0,
         )
+        edge = self._check(report, "edge_strip")
+        self.assertEqual(edge["status"], "PASS")
+        self.assertIn("已被产品掩膜覆盖", edge["note_zh"])
+        self.assertAlmostEqual(edge["value"]["mask_coverage_pct"]["right"], 100.0)
+
+    def test_partial_product_mask_keeps_noisy_edge_warning(self):
+        phase = self.grids["phasefilt.grd"].copy()
+        rng = np.random.default_rng(31)
+        phase[:, -18:-3] = rng.uniform(-float(np.pi), float(np.pi), (self.ny, 15))
+        phase[:, -3:] = 0.0
+        self._write_grid(self.intf_dir / "phasefilt.grd", phase)
+        mask = np.ones((self.ny, self.nx), dtype=np.float32)
+        mask[:, -9:] = np.nan
+        self._write_grid(self.intf_dir / "product_mask.grd", mask)
+        result, report = self._run_qa()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        edge = self._check(report, "edge_strip")
+        self.assertEqual(edge["status"], "WARN")
+        right_coverage = edge["value"]["mask_coverage_pct"]["right"]
+        self.assertGreater(right_coverage, 0.0)
+        self.assertLess(right_coverage, 99.0)
 
     def test_interior_noisy_band_is_not_reported_as_edge_noise(self):
         phase = self.grids["phasefilt.grd"].copy()
