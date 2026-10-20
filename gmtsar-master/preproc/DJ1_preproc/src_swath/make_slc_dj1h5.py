@@ -35,6 +35,7 @@ import dj1_meta as dm  # noqa: E402
 TARGET_MEDIAN = 150.0
 CLIP_LEVEL = 32000.0
 MIN_MEDIAN = 20.0
+PV_DRIFT_WARN_M = 0.05           # 位置与速度两种说法在景内的相对漂移超过它 (约 3 周的视线向相位) 就警告
 
 
 def _import_h5py():
@@ -263,11 +264,21 @@ def write_metadata(prod, name, naz, nrg, extra, quiet=False):
             prod.orbit_level, oi["regularized"], oi["max_tag_residual_s"]))
         f.write("led_vectors = %d\nled_step_s = %.9f\nled_extended = %s\nled_max_dev_m = %.3f\n" % (
             len(orb["t"]), orb["dt"], orb["extended"], orb["max_dev_m"]))
+        f.write("led_max_dev_window_m = %.3f\nled_pv_mismatch_mps = %.4f\nled_pv_drift_m = %.3f\n"
+                "led_center_velocity = %s\n" % (
+                    orb["max_dev_window_m"], orb["pv_mismatch_mps"],
+                    orb["pv_mismatch_mps"] * (prod.t_zd_end - prod.t_zd_start),
+                    "xml_velocity" if orb["extended"] else "original_vectors"))
         f.write("xml_doppler_fd1 = %.6f\n" % (prod.dc_poly[0] if prod.dc_poly else 0.0))
     if not quiet:
         print("\n[make_slc_dj1h5] 轨道 (%s): %s; LED %d 个矢量, 间隔 %.3f s, %s, 与原始矢量最大位置差 %.2f m" % (
             prod.orbit_level, oi["reason"], len(orb["t"]), orb["dt"],
             "已外推到场景前后" if orb["extended"] else "沿用原始矢量", orb["max_dev_m"]))
+        drift = orb["pv_mismatch_mps"] * (prod.t_zd_end - prod.t_zd_start)
+        if drift > PV_DRIFT_WARN_M:
+            print("[make_slc_dj1h5] 警告: %s 轨道的位置与速度不自洽 (成像时段内平均速度差 %.3f m/s, 景内相对漂移约 %.2f m > %.2f m), "
+                  "LED 中心速度已取速度矢量; 该景轨道精度需留意, 建议申请更高等级的轨道" % (
+                      name, orb["pv_mismatch_mps"], drift, PV_DRIFT_WARN_M))
     return orb
 
 

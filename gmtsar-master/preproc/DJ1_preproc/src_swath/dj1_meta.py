@@ -247,6 +247,23 @@ class Product:
         vel = (d00 * p0 + d10 * h * v0 + d01 * p1 + d11 * h * v1) / h
         return pos, vel
 
+    def xml_velocity(self, t, half_window=0.5, min_pts=5):
+        """XML 速度矢量在 t 时刻的值 (ECEF): 取 t 前后 half_window 秒内的速度矢量 (不足 min_pts 个就取最近的 min_pts 个),
+        各分量做二次拟合。
+
+        与 sat_state() 返回的速度不同: 后者是位置 Hermite 样条的导数。位置序列与速度序列自洽时两者一致 (在矢量节点上
+        总是一致); 不自洽时, 样条导数在两个矢量之间偏离速度矢量 (中点处偏差为 1.5 x (位置有限差分 - 速度矢量))。
+        实时轨道常见这种情形: 速度矢量很光滑, 位置只取整到亚毫米, 但 (位置 - 速度的积分) 随时间漂移; 以样条导数作外推起点,
+        中心速度就会带上这份偏差, 外推轨道在景内累积成随方位向线性增长的视线向误差, 干涉图上表现为方位向的平面斜坡。
+        所以外推起点的速度取速度矢量 (对应的不自洽程度用 pv_mismatch 监控)。"""
+        ts = self.sv_t
+        idx = np.nonzero(np.abs(ts - t) <= half_window)[0]
+        if len(idx) < min_pts:
+            idx = np.sort(np.argsort(np.abs(ts - t))[:min_pts])
+        x = ts[idx] - t
+        deg = min(2, len(idx) - 1)
+        return np.array([np.polyfit(x, self.sv_v[idx, k], deg)[-1] for k in range(3)])
+
     def gmtsar_orbit(self, margin=10.0, step=0.5, min_margin=6.0):
         """生成 GMTSAR 能直接使用的等间隔轨道, 覆盖成像时段前后至少 margin 秒。
 
@@ -257,7 +274,13 @@ class Product:
 
         原始轨道 (时间轴规整后) 等间隔且两端余量都不小于 min_margin 时原样使用; 否则以场景中心时刻的状态为起点,
         用 propagate_state 向两侧外推, 重建 step 间隔的等间隔轨道。
-        返回 dict(t0, dt, t, p, v, extended, max_dev_m): max_dev_m 是外推轨道与原始矢量在成像时段内的最大位置差。"""
+        外推起点: 位置取 sat_state(t_c) (三次 Hermite, 矢量间隔很小时位置误差可忽略), 速度取 xml_velocity(t_c)
+        (XML 速度矢量的局部拟合), 而不是位置样条的导数, 见 xml_velocity 的说明。
+        返回 dict(t0, dt, t, p, v, extended, max_dev_m, max_dev_window_m, pv_mismatch_mps):
+        max_dev_m 是外推轨道与全部原始位置矢量 (含成像时段之外的) 的最大位置差; max_dev_window_m 只统计成像时段内的矢量;
+        pv_mismatch_mps 是成像时段附近 位置给出的平均速度 与 速度矢量给出的平均速度 之差 (m/s, 见 pv_mismatch):
+        位置与速度自洽时接近 0; 乘以成像时长约等于该景内位置与速度两种说法的相对漂移, 超过几厘米就说明轨道的
+        位置与速度不自洽 (已按速度矢量定中心速度, 但这一景的轨道精度需要留意)。"""
         t_lo, t_hi = self.t_zd_start - margin, self.t_zd_end + margin
         ts = self.sv_t
         n0 = len(ts)
@@ -265,9 +288,12 @@ class Product:
         uniform = n0 >= 10 and np.ptp(dts) <= 2e-6
         if uniform and ts[0] <= self.t_zd_start - min_margin and ts[-1] >= self.t_zd_end + min_margin:
             return dict(t0=float(ts[0]), dt=float((ts[-1] - ts[0]) / (n0 - 1)), t=ts.copy(), p=self.sv_p.copy(),
-                        v=self.sv_v.copy(), extended=False, max_dev_m=0.0)
+                        v=self.sv_v.copy(), extended=False, max_dev_m=0.0, max_dev_window_m=0.0,
+                        pv_mismatch_mps=self.pv_mismatch())
         t_c = self.t_mid
-        p_c, v_c = self.sat_state(t_c)
+        p_c = self.sat_state(t_c)[0]
+        v_c = self.xml_velocity(t_c)
+        pv_mismatch = self.pv_mismatch()
         n = int(math.ceil((t_hi - t_lo) / step)) + 1
         t = t_lo + step * np.arange(n)
         P, V = np.empty((n, 3)), np.empty((n, 3))
@@ -278,10 +304,28 @@ class Product:
                 pp, vv = propagate_state(pp, vv, t[k] - tt)
                 tt = t[k]
                 P[k], V[k] = pp, vv
-        dev = 0.0
+        dev = dev_win = 0.0
         for tk, pk in zip(ts, self.sv_p):
-            dev = max(dev, float(np.linalg.norm(propagate_state(p_c, v_c, tk - t_c)[0] - pk)))
-        return dict(t0=float(t[0]), dt=float(step), t=t, p=P, v=V, extended=True, max_dev_m=dev)
+            d = float(np.linalg.norm(propagate_state(p_c, v_c, tk - t_c)[0] - pk))
+            dev = max(dev, d)
+            if self.t_zd_start <= tk <= self.t_zd_end:
+                dev_win = max(dev_win, d)
+        return dict(t0=float(t[0]), dt=float(step), t=t, p=P, v=V, extended=True, max_dev_m=dev,
+                    max_dev_window_m=dev_win, pv_mismatch_mps=pv_mismatch)
+
+    def pv_mismatch(self, pad=1.0, min_pts=5):
+        """成像时段前后各 pad 秒内, 位置给出的平均速度与速度矢量给出的平均速度之差 (m/s):
+        |(位置净位移 - 速度矢量的梯形积分) / 时间跨度|。位置与速度自洽时接近 0; 不依赖场景中心落在矢量的哪个位置,
+        也不受位置取整噪声影响 (净位移只用首尾两个位置)。窗口内矢量不足 min_pts 个时取场景中心附近最近的 min_pts 个。"""
+        ts = self.sv_t
+        idx = np.nonzero((ts >= self.t_zd_start - pad) & (ts <= self.t_zd_end + pad))[0]
+        if len(idx) < min_pts:
+            idx = np.sort(np.argsort(np.abs(ts - self.t_mid))[:min_pts])
+        if len(idx) < 2:
+            return float("nan")
+        dt = np.diff(ts[idx])
+        integ = np.sum(0.5 * (self.sv_v[idx[1:]] + self.sv_v[idx[:-1]]) * dt[:, None], axis=0)
+        return float(np.linalg.norm(self.sv_p[idx[-1]] - self.sv_p[idx[0]] - integ) / (ts[idx[-1]] - ts[idx[0]]))
 
     def zero_doppler_time(self, target, t_guess=None):
         """目标点 (ECEF) 的零多普勒时刻: 使 (P(t)-T)·V(t)=0 的 t。二分法, 不外推。"""
