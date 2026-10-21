@@ -53,6 +53,17 @@ THRESHOLDS = {
         "warn_invalid_fraction_above": 0.01,
         "fail_invalid_fraction_above": 0.10,
     },
+    "detrend": {
+        "warn_ramp_weeks_above": 3.0,
+    },
+    "coreg": {
+        "warn_frac_within_0p3_below": 0.9,
+        "outlier_abs_px": 1.0,
+    },
+    "orbit": {
+        "pv_mismatch_warn_above_mps": 0.02,
+        "pv_drift_warn_above_m": 0.05,
+    },
     "snaphu_config": {
         "lambda_relative_warn_above": 0.05,
         "near_range_relative_warn_above": 0.10,
@@ -137,17 +148,31 @@ def _coreg_check(project_dir):
             "robust_sigma_range_px": robust_r,
             "robust_sigma_azimuth_px": robust_a,
             "frac_within_0p3": verify_check.get("frac_within_0p3"),
+            "rmse_range_px": verify_check.get("rmse_r"),
+            "rmse_azimuth_px": verify_check.get("rmse_a"),
+            "max_abs_range_px": verify_check.get("max_abs_r"),
+            "max_abs_azimuth_px": verify_check.get("max_abs_a"),
         }
+        thresholds = {"estimate_gate": "passed", "verify_gate": "passed", **THRESHOLDS["coreg"]}
         passed = estimate_passed and verify_passed
         note = "估计与独立复核门限均通过。" if passed else "估计或独立复核门限未通过。"
-        return _check(
-            "coreg",
-            "配准质量",
-            value,
-            {"estimate_gate": "passed", "verify_gate": "passed"},
-            "PASS" if passed else "FAIL",
-            note,
-        )
+        status = "PASS" if passed else "FAIL"
+        frac = verify_check.get("frac_within_0p3")
+        if passed and isinstance(frac, (int, float)) and frac < THRESHOLDS["coreg"]["warn_frac_within_0p3_below"]:
+            status = "WARN"
+            note = "门限通过，但独立复核点中偏差不超过 0.3 像素的比例偏低，配准精度需人工复核。"
+        outliers = [
+            axis
+            for axis, key in (("距离向", "max_abs_r"), ("方位向", "max_abs_a"))
+            if isinstance(verify_check.get(key), (int, float))
+            and verify_check[key] > THRESHOLDS["coreg"]["outlier_abs_px"]
+        ]
+        if outliers:
+            note += " 复核点存在偏差超过 %.1f 像素的离群点（%s）；稳健 σ 不含离群点，请对照 RMSE 与最大值。" % (
+                THRESHOLDS["coreg"]["outlier_abs_px"],
+                "、".join(outliers),
+            )
+        return _check("coreg", "配准质量", value, thresholds, status, note)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return _check(
             "coreg",
@@ -157,6 +182,43 @@ def _coreg_check(project_dir):
             "FAIL",
             "配准报告无法读取或结构无效。",
         )
+
+
+def _orbit_check(project_dir):
+    """读 make_slc_dj1h5 写下的 *.convert.txt，轨道位置与速度不自洽时给出警告（不自动校正）。"""
+    files = sorted((Path(project_dir) / "SLC").glob("*.convert.txt"))
+    found = {}
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        item = {}
+        for line in text.splitlines():
+            key, sep, raw = line.partition("=")
+            key = key.strip()
+            if sep and key in ("led_pv_mismatch_mps", "led_pv_drift_m", "led_max_dev_window_m"):
+                try:
+                    item[key] = float(raw.strip())
+                except ValueError:
+                    pass
+        if item:
+            found[path.name.replace(".convert.txt", "")] = item
+    thresholds = THRESHOLDS["orbit"]
+    if not found:
+        return _check("orbit", "轨道一致性", None, thresholds, "SKIP", "未找到轨道指标（*.convert.txt），跳过。")
+    bad = [
+        name
+        for name, item in found.items()
+        if item.get("led_pv_mismatch_mps", 0.0) > thresholds["pv_mismatch_warn_above_mps"]
+        or item.get("led_pv_drift_m", 0.0) > thresholds["pv_drift_warn_above_m"]
+    ]
+    note = (
+        "景 %s 的轨道位置与速度不自洽，预期残留轨道斜坡；建议改用更高等级轨道，并留意去趋势量。" % "、".join(bad)
+        if bad
+        else "轨道位置与速度自洽性在阈值内。"
+    )
+    return _check("orbit", "轨道一致性", found, thresholds, "WARN" if bad else "PASS", note)
 
 
 def _coherence_check(corr, corr_thresh):
@@ -649,14 +711,16 @@ def _detrend_check(ramp, unwrap, detrended, corr, wavelength):
         "unwrap_detrended_std_corr_ge_0p5_rad": float(np.std(detrended[mask])) if np.any(mask) else None,
         "valid_high_corr_pixels": int(np.count_nonzero(mask)),
     }
-    return _check(
-        "detrend",
-        "去趋势效果",
-        value,
-        None,
-        "INFO",
-        "报告轨道坡度峰峰值及高相干区解缠前后标准差；仅作诊断。",
-    )
+    ramp_weeks = ramp_ptp / (2.0 * math.pi) if ramp_ptp is not None else None
+    value["orbital_ramp_peak_to_peak_weeks"] = ramp_weeks
+    limit = THRESHOLDS["detrend"]["warn_ramp_weeks_above"]
+    if ramp_weeks is not None and ramp_weeks > limit:
+        status = "WARN"
+        note = "去掉的轨道坡度达 %.1f 周（> %.1f 周），可能掩盖了轨道几何问题或长波长的真实信号；请先排查轨道。" % (ramp_weeks, limit)
+    else:
+        status = "PASS" if ramp_weeks is not None else "INFO"
+        note = "去掉的轨道坡度在阈值内；同时报告高相干区解缠前后标准差。"
+    return _check("detrend", "去趋势效果", value, {"warn_ramp_weeks_above": limit}, status, note)
 
 
 def _los_check(los, corr):
@@ -1065,6 +1129,7 @@ def _run(args):
 
     checks = []
     checks.append(_coreg_check(project_dir))
+    checks.append(_orbit_check(project_dir))
     checks.append(_coherence_check(grids["corr"], args.corr_thresh))
     residue_value, residue_mask, valid_loops = _residue_metrics(grids["phase"], grids["corr"])
     checks.append(_residue_check(residue_value))

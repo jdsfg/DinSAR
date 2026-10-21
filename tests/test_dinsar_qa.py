@@ -317,6 +317,55 @@ class DinsarQASyntheticTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self._check(report, "snaphu_config")["status"], "WARN")
 
+    def _write_coreg(self, **check):
+        base = {"n_valid": 100, "n_points": 100, "frac_within_0p3": 0.98,
+                "robust_sigma_r": 0.02, "robust_sigma_a": 0.03}
+        base.update(check)
+        (self.project_dir / "SLC" / "coreg_report.json").write_text(
+            json.dumps({"gate": {"passed": True}, "verify": {"gate": {"passed": True}, "check": base}}),
+            encoding="utf-8",
+        )
+
+    def test_low_fraction_within_0p3_warns(self):
+        self._write_coreg(frac_within_0p3=0.8)
+        result, report = self._run_qa()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._check(report, "coreg")["status"], "WARN")
+
+    def test_coreg_outlier_is_reported_next_to_rmse(self):
+        self._write_coreg(rmse_r=0.39, max_abs_r=5.4, rmse_a=0.07, max_abs_a=0.6)
+        result, report = self._run_qa()
+        check = self._check(report, "coreg")
+        self.assertEqual(check["status"], "PASS")
+        self.assertEqual(check["value"]["max_abs_range_px"], 5.4)
+        self.assertEqual(check["value"]["rmse_range_px"], 0.39)
+        self.assertIn("离群点", check["note_zh"])
+
+    def test_large_removed_ramp_warns(self):
+        x = np.arange(self.nx, dtype=np.float32)[None, :] * np.ones((self.ny, 1), dtype=np.float32)
+        y = np.arange(self.ny, dtype=np.float32)[:, None] * np.ones((1, self.nx), dtype=np.float32)
+        self._write_grid(self.project_dir / "debug" / "orbital_ramp.grd", 0.02 * x + 0.5 * y)
+        result, report = self._run_qa()
+        check = self._check(report, "detrend")
+        self.assertEqual(check["status"], "WARN")
+        self.assertGreater(check["value"]["orbital_ramp_peak_to_peak_weeks"], 3.0)
+
+    def test_small_removed_ramp_passes(self):
+        result, report = self._run_qa()
+        self.assertEqual(self._check(report, "detrend")["status"], "PASS")
+
+    def test_orbit_inconsistency_warns_and_missing_is_skipped(self):
+        result, report = self._run_qa()
+        self.assertEqual(self._check(report, "orbit")["status"], "SKIP")
+        (self.project_dir / "SLC" / "20300105.convert.txt").write_text(
+            "led_pv_mismatch_mps = 0.058\nled_pv_drift_m = 0.20\n", encoding="utf-8")
+        result, report = self._run_qa()
+        self.assertEqual(self._check(report, "orbit")["status"], "WARN")
+        (self.project_dir / "SLC" / "20300105.convert.txt").write_text(
+            "led_pv_mismatch_mps = 0.005\nled_pv_drift_m = 0.01\n", encoding="utf-8")
+        result, report = self._run_qa()
+        self.assertEqual(self._check(report, "orbit")["status"], "PASS")
+
     def test_missing_coreg_report_is_skipped(self):
         (self.project_dir / "SLC" / "coreg_report.json").unlink()
         result, report = self._run_qa()
