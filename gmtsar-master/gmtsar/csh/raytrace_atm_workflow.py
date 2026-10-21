@@ -42,7 +42,6 @@ def locate_raytrace_bin():
     candidates = [
         "/tmp/atm_raytrace",
         Path(__file__).resolve().parents[1] / "atm_raytrace",
-        Path("/home/mihu/.gemini/antigravity-cli/brain/b7e5878e-56ae-4d39-ae08-f151da5e8456/scratch/atm/atm_raytrace"),
     ]
     for c in candidates:
         if os.path.isfile(str(c)) and os.access(str(c), os.X_OK):

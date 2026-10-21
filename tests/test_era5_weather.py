@@ -159,9 +159,9 @@ class Era5Weather(unittest.TestCase):
 
     def test_prm_clock_start_parses_fractional_day_as_utc(self):
         prm = self.folder / "clock.PRM"
-        prm.write_text("SC_clock_start = 2026247.1831530258\n")
+        prm.write_text("SC_clock_start = 2030005.1831530258\n")
         parsed = workflow.prm_epoch_utc(prm)
-        expected = datetime(2026, 9, 4, 4, 23, 44, 400000, tzinfo=timezone.utc)
+        expected = datetime(2030, 1, 5, 4, 23, 44, 400000, tzinfo=timezone.utc)
         self.assertLessEqual(abs((parsed - expected).total_seconds()), 1.0)
 
     def write_epoch_cube(self, path, epoch):

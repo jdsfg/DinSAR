@@ -60,3 +60,19 @@ test_data/
 # Python bytecode and GMT session history
 __pycache__/
 gmt.history
+
+# Built executables (build locally; do not commit)
+gmtsar-master/gmtsar/xcorr2
+gmtsar-master/gmtsar/resamp_omp
+gmtsar-master/gmtsar/SAT_llt2rat2
+gmtsar-master/gmtsar/offset_topo_omp
+gmtsar-master/gmtsar/offset_topo2
+gmtsar-master/preproc/DJ1_preproc/src_swath/make_slc_dj1
+
+# Local scratch
+__pycache__/
+test_tool_write.tmp
+gmt.history
+
+# Stale vendored installer copy (removed from git)
+deploy/GMTSAR_Deploy_Package/

@@ -37,7 +37,7 @@ try:
 except ImportError:
     HAVE_IMAGING = False
 
-MASTER, SLAVE = "20260904", "20260912"
+MASTER, SLAVE = "20300105", "20300113"
 XML_H5 = ("<root><satellite_name>Dianjian-01</satellite_name>"
           "<acquisition_start_utc>%s</acquisition_start_utc></root>")
 XML_OLD = "<root><SatelliteID>DJ1</SatelliteID><startTime>%s</startTime></root>"
@@ -67,7 +67,7 @@ def make_raw(project, kind):
     """raw/ 里放两景: kind = h5 (XML + h5 + 预览 tiff) / old (XML + tiff) / mixed (主影像有 h5, 辅影像只有 tiff)。"""
     raw = os.path.join(project, "raw")
     os.makedirs(raw)
-    for date, iso in ((MASTER, "2026-09-04T04:23:44"), (SLAVE, "2026-09-12T04:23:43")):
+    for date, iso in ((MASTER, "2030-01-05T04:23:44"), (SLAVE, "2030-01-13T04:23:43")):
         stem = "scene_" + date
         if kind == "old":
             write(os.path.join(raw, stem + ".xml"), XML_OLD % (iso + "Z"))

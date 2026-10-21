@@ -32,7 +32,7 @@ REPO = os.path.abspath(os.path.join(HERE, ".."))
 SCRIPT = os.path.join(REPO, "run_dinsar.sh")
 RESAMP = shutil.which("resamp") or os.path.expanduser("~/gmtsar/gmtsar-master/bin/resamp")
 HAVE_RESAMP = os.path.isfile(RESAMP) and os.access(RESAMP, os.X_OK)
-MASTER, SLAVE = "20260101", "20260113"
+MASTER, SLAVE = "20300101", "20300113"
 
 
 def md5(path):

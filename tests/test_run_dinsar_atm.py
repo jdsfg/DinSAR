@@ -19,13 +19,13 @@ class AtmosphericWorkflow(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="atm_workflow_")
         self.addCleanup(self.tmp.cleanup)
         self.project = Path(self.tmp.name)
-        self.intf = self.project / "intf/20260904_20260912"
+        self.intf = self.project / "intf/20300105_20300113"
         for path in (self.intf, self.project / "topo", self.project / "debug", self.project / "weather", self.project / "SLC"):
             path.mkdir(parents=True, exist_ok=True)
-        self.prm = self.intf / "20260904.PRM"
-        self.prm.write_text("led_file = 20260904.LED\nrng_samp_rate = 60000000\nPRF = 2000\n"
+        self.prm = self.intf / "20300105.PRM"
+        self.prm.write_text("led_file = 20300105.LED\nrng_samp_rate = 60000000\nPRF = 2000\n"
                             "SC_vel = 7500\nradar_wavelength = 0.031\nSC_height = 600000\nSC_height = 600001\n")
-        self.led = self.project / "SLC/20260904.LED"
+        self.led = self.project / "SLC/20300105.LED"
         self.led.write_text("orbit fixture\n")
         self.log = self.project / "processing.log"
         self.stub = self.project / "correction.csh"
@@ -33,7 +33,7 @@ class AtmosphericWorkflow(unittest.TestCase):
         self.gmt("grdmath", "-R100/140/200/240", "-I4", "1500", "X", "ADD", "=", "dem_ra.grd")
         shutil.copyfile(self.intf / "dem_ra.grd", self.project / "topo/dem.grd")
         (self.intf / "trans.dat").write_bytes(b"fixture")
-        for date in ("20260904", "20260912"):
+        for date in ("20300105", "20300113"):
             for ext in ("ztd", "ztd.rsc"):
                 (self.project / "weather" / f"{date}.{ext}").write_bytes(b"fixture")
         self.original = (self.intf / "unwrap.grd").read_bytes()
@@ -52,10 +52,10 @@ class AtmosphericWorkflow(unittest.TestCase):
         snippet = '''
 source ./run_dinsar.sh
 PROJECT_DIR="$TEST_PROJECT"
-INTF_DIR="$PROJECT_DIR/intf/20260904_20260912"
+INTF_DIR="$PROJECT_DIR/intf/20300105_20300113"
 LOG_FILE="$PROJECT_DIR/processing.log"
-MASTER_DATE=20260904
-SLAVE_DATE=20260912
+MASTER_DATE=20300105
+SLAVE_DATE=20300113
 ATM_MODE="$TEST_MODE"
 GACOS_PATH="$PROJECT_DIR/weather"
 find_atm_script() { printf '%s\\n' "$TEST_SCRIPT"; }
@@ -226,7 +226,7 @@ find_atm_script() { printf '%s\\n' "$TEST_SCRIPT"; }
 
     def assert_gacos_reads_resolved_orbit(self):
         original_prm = self.prm.read_bytes()
-        self.write_stub('set orbit = `awk \'$1 == "led_file" {print $3; exit}\' 20260904.PRM`\n'
+        self.write_stub('set orbit = `awk \'$1 == "led_file" {print $3; exit}\' 20300105.PRM`\n'
                         'if ( ! -f "$orbit" ) exit 7\n'
                         'if ( "`cat $orbit`" != "orbit fixture" ) exit 8\n'
                         'gmt grdmath unwrap.grd 2 SUB = unwrap_gacos_corrected.grd\n')
@@ -245,11 +245,11 @@ find_atm_script() { printf '%s\\n' "$TEST_SCRIPT"; }
         self.assert_gacos_reads_resolved_orbit()
 
     def test_gacos_preserves_relative_orbit_reference(self):
-        self.prm.write_text(self.prm.read_text().replace("led_file = 20260904.LED", "led_file = ../../SLC/20260904.LED"))
+        self.prm.write_text(self.prm.read_text().replace("led_file = 20300105.LED", "led_file = ../../SLC/20300105.LED"))
         self.assert_gacos_reads_resolved_orbit()
 
     def test_gacos_preserves_absolute_orbit_reference(self):
-        self.prm.write_text(self.prm.read_text().replace("led_file = 20260904.LED", f"led_file = {self.led}"))
+        self.prm.write_text(self.prm.read_text().replace("led_file = 20300105.LED", f"led_file = {self.led}"))
         self.assert_gacos_reads_resolved_orbit()
 
     def test_gacos_checkpoint_rejects_changed_orbit(self):
@@ -277,7 +277,7 @@ find_atm_script() { printf '%s\\n' "$TEST_SCRIPT"; }
     def test_changed_gacos_data_rejected(self):
         self.write_stub('gmt grdmath unwrap.grd 2 SUB = unwrap_gacos_corrected.grd\n')
         self.assertEqual(self.run_atm("GACOS").returncode, 0)
-        (self.project / "weather/20260912.ztd").write_bytes(b"new weather")
+        (self.project / "weather/20300113.ztd").write_bytes(b"new weather")
         self.assertNotEqual(self.run_atm("GACOS").returncode, 0)
 
     def test_gacos_failure_does_not_accept_old_product(self):

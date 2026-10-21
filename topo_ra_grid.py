@@ -14,8 +14,8 @@
                         gmt xyz2grd out.f32 -R0/num_rng/0/num_az -I<dec> -r -ZTLf -Gdem_ra.grd
                     (-ZTL: 文件第一行放在网格最上面一行, 正好是 GMT 内存里的第 0 行)。
 
-为什么不用 gmt triangulate: 这里的 GMT 用的是 Watson 算法, 电建一号 SM 整景的 105 万个 DEM 点跑了 15 分钟还没完。
-scipy 的 Qhull Delaunay 处理同样的点只要约 9 秒, 再内插到 2270 万个节点约 9 秒, 峰值内存约 0.8 GB。
+为什么不用 gmt triangulate: 这里的 GMT 用的是 Watson 算法, 整景规模 (百万量级 DEM 点) 跑了十几分钟还没完。
+scipy 的 Qhull Delaunay 处理同样的点只要几秒, 再内插到整景节点也只要几秒, 内存占用也小得多。
 两者都是对同一批点做 Delaunay 三角网上的线性内插, 结果一致 (见 tests/test_topo_ra_grid.py)。
 点云是整体送进 Qhull 的, 每百万点约占 0.8 GB 内存。
 """

@@ -312,7 +312,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="电建一号新版产品 -> GMTSAR SLC/PRM/LED")
     ap.add_argument("xml")
     ap.add_argument("h5", help="产品 h5 (用 --metadata-only 时不读取, 可写 -)")
-    ap.add_argument("name", help="输出前缀, 例如 20260904 -> 20260904.SLC/.PRM/.LED")
+    ap.add_argument("name", help="输出前缀, 例如 20300105 -> 20300105.SLC/.PRM/.LED")
     ap.add_argument("--scale", type=float, help="int16 比例因子 (默认按幅度统计自动选择)")
     ap.add_argument("--block-lines", type=int, default=256)
     ap.add_argument("--info", action="store_true", help="只打印 h5 结构和元数据, 不转换")

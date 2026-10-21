@@ -41,7 +41,7 @@ GM = 3.986004418e14
 R_ORBIT = 6378137.0 + 531000.0
 INCL = math.radians(97.5)
 OMEGA = math.sqrt(GM / R_ORBIT ** 3)
-T_REF = dm.to_sec(dt.datetime(2026, 9, 4, 4, 23, 45))   # 场景中心时刻
+T_REF = dm.to_sec(dt.datetime(2030, 1, 5, 4, 23, 45))   # 场景中心时刻
 
 
 def _orbit_state(t, node_lon=0.0, tshift=0.0):
@@ -101,15 +101,16 @@ def _ecef_to_llh(x):
     return math.degrees(lat), lon, h
 
 
-def make_xml(path, name="ICEYE_SM_SLC_1SVV_20260904t042344_000001_000022_0003fe", acq_id=1, mode="SM",
+def make_xml(path, name="SAT_SM_SLC_1SVV_20300105t042344_000001_000001_000001", acq_id=1, mode="SM",
              pol="VV", orbit_dir="DESCENDING", look_side="left", look_angle=33.8, heading=192.8,
              n_az=40, n_rg=32, ati=2.358e-4, dr=0.7495, fs=200e6, bw=160e6, r0=640000.0,
              tshift=0.0, pos_offset=(0.0, 0.0, 0.0), zd_delay=0.0, half_width_deg=0.2, center_shift_deg=0.0,
              n_vec=161, vec_step=0.5, prf=None, orbit_fn=None, tag_quant=0.0, vel_noise=0.0,
-             orbit_level="Rapid orbit"):
+             orbit_level="Rapid orbit", vel_bias=(0.0, 0.0, 0.0)):
     """写一份结构与真实产品一致的扁平 XML。zd_delay: 起始时间相对 T_REF 的延后秒数。
     orbit_fn(t) -> (位置, 速度) 可替换轨道模型; tag_quant 把 XML 里的矢量时间标签量化到该间隔 (模拟实测的标签抖动);
-    vel_noise 给速度加高斯噪声 (模拟位置与速度不自洽)。"""
+    vel_noise 给速度加高斯噪声 (模拟位置与速度不自洽); vel_bias 给全部速度矢量加同一个常量偏置 (模拟位置的导数
+    与速度矢量系统性不一致的轨道)。"""
     ctr = _center_target()
     lat, lon, h = _ecef_to_llh(ctr)
     lon += center_shift_deg
@@ -128,6 +129,7 @@ def make_xml(path, name="ICEYE_SM_SLC_1SVV_20260904t042344_000001_000022_0003fe"
         p = p + np.array(pos_offset)
         if vel_noise:
             v = v + vel_noise * np.random.default_rng(i).standard_normal(3)
+        v = v + np.array(vel_bias)
         tag = round((t - T_REF) / tag_quant) * tag_quant + T_REF if tag_quant else t
         rows += ["    <orbit_vector>", "      <number>%d</number>" % (i + 1), "      <time>%s</time>" % _fmt_time(tag)]
         # 位置/速度的小数位不能太少: 插值速度是位置样条的导数, 位置舍入 δ 会带来约 δ/步长 的速度误差,
@@ -184,7 +186,7 @@ class TestParseAndOrbit(unittest.TestCase):
         self.assertEqual(p.dc_poly, [-120.0, 3.5e5, 0.0])
         self.assertEqual(len(p.sv_t), 161)
         self.assertAlmostEqual(p.t_zd_end - p.t_zd_start, 40 * 2.358e-4, places=6)
-        self.assertEqual(p.date, "20260904")
+        self.assertEqual(p.date, "20300105")
 
     def test_rejects_old_format(self):
         bad = os.path.join(self.tmp.name, "old.xml")
@@ -318,12 +320,69 @@ class TestGmtsarOrbit(unittest.TestCase):
             self.assertLess(np.linalg.norm(o["v"][k] - vt), 0.005)
         self.assertLess(o["max_dev_m"], 0.05)
 
+    def test_xml_velocity_matches_vectors(self):
+        """xml_velocity 在密集轨道与稀疏轨道 (窗口内不足 5 个矢量) 上都应还原速度矢量"""
+        bias = np.array([0.0, 0.03, 0.05])
+        for n, step in ((41, 0.025), (161, 0.5)):
+            p = self._prod("xv%d" % n, n_vec=n, vec_step=step, vel_bias=tuple(bias), zd_delay=0.0125)
+            for dt in (0.0, 0.0125, 0.3):
+                t = p.t_mid + dt
+                np.testing.assert_allclose(p.xml_velocity(t), _dyn_state(t)[1] + bias, atol=2e-4)
+
+    def test_inconsistent_pv_center_velocity_follows_xml(self):
+        """位置导数与速度矢量系统性不一致的轨道: LED 中心速度应取速度矢量, 不是位置样条的导数。
+        场景中心落在两个矢量的中点 (样条导数在这里偏离速度矢量最多, 偏差 1.5 x 位置/速度差)。"""
+        bias = np.array([0.0, 0.03, 0.05])
+        p = self._prod("pv", n_vec=41, vec_step=0.025, zd_delay=0.0125, tag_quant=1.7e-4, vel_bias=tuple(bias),
+                       orbit_level="Real Time orbit")
+        self.assertTrue(p.orbit_info["regularized"], p.orbit_info)
+        o = p.gmtsar_orbit()
+        self.assertTrue(o["extended"])
+        t_c = p.t_mid
+        v_xml = _dyn_state(t_c)[1] + bias
+        v_spline = p.sat_state(t_c)[1]
+        # 样条导数确实偏了 (偏置的沿轨分量会被时间轴规整里的间隔估计吸收一部分, 所以小于 1.5 x |bias| = 0.087)
+        self.assertGreater(np.linalg.norm(v_spline - v_xml), 0.04)
+        # 窗口平均速度失配 = 偏置中垂直于速度的部分 (沿轨分量被时间轴规整的间隔估计吸收了)
+        v_hat = _dyn_state(t_c)[1] / np.linalg.norm(_dyn_state(t_c)[1])
+        b_perp = bias - (bias @ v_hat) * v_hat
+        self.assertAlmostEqual(o["pv_mismatch_mps"], np.linalg.norm(b_perp), delta=1e-3)
+        # LED 里离场景中心最近的点 = 以 (中心位置, XML 速度) 为起点外推的结果
+        k = int(np.argmin(np.abs(o["t"] - t_c)))
+        p_c = p.sat_state(t_c)[0]
+        p_x, v_x = dm.propagate_state(p_c, v_xml, o["t"][k] - t_c)
+        np.testing.assert_allclose(o["v"][k], v_x, atol=1e-5)
+        np.testing.assert_allclose(o["p"][k], p_x, atol=1e-6)
+        _, v_s = dm.propagate_state(p_c, v_spline, o["t"][k] - t_c)
+        self.assertGreater(np.linalg.norm(o["v"][k] - v_s), 0.04)           # 与旧做法 (样条导数) 明显不同
+
+    def test_consistent_pv_has_no_mismatch(self):
+        """位置与速度自洽的轨道: 失配量接近 0, LED 与以样条速度为起点的外推一致"""
+        p = self._prod("ok", n_vec=41, vec_step=0.025, zd_delay=0.0125, orbit_level="Real Time orbit")
+        o = p.gmtsar_orbit()
+        self.assertLess(o["pv_mismatch_mps"], 1e-3)
+        t_c = p.t_mid
+        pc, vs = p.sat_state(t_c)
+        k = int(np.argmin(np.abs(o["t"] - t_c)))
+        _, v_old = dm.propagate_state(pc, vs, o["t"][k] - t_c)
+        np.testing.assert_allclose(o["v"][k], v_old, atol=2e-3)
+
+    def test_max_dev_window_only_counts_imaging_vectors(self):
+        p = self._prod("dw", n_vec=161, vec_step=0.025, zd_delay=0.0125, vel_bias=(0.0, 0.03, 0.05),
+                       n_az=4000, ati=1.0 / 4000.0, orbit_level="Real Time orbit")
+        o = p.gmtsar_orbit()
+        self.assertTrue(o["extended"])
+        self.assertLessEqual(o["max_dev_window_m"], o["max_dev_m"])
+        self.assertGreater(o["max_dev_m"], 0.0)
+
     def test_long_uniform_orbit_kept_as_is(self):
         p = self._prod("l", n_vec=161, vec_step=0.5)
         o = p.gmtsar_orbit()
         self.assertFalse(o["extended"])
         self.assertEqual(len(o["t"]), 161)
         np.testing.assert_array_equal(o["p"], p.sv_p)
+        self.assertLess(o["pv_mismatch_mps"], 1e-3)
+        self.assertEqual(o["max_dev_window_m"], 0.0)
 
     def test_gmtsar_calc_dop_orb_coverage_requirement(self):
         """calc_dop_orb 在影像起止时刻前后各 ±2 s 取轨道: 生成的轨道必须全部覆盖"""
@@ -509,7 +568,7 @@ class TestConverter(unittest.TestCase):
 
     def _convert(self, layout, scale=2.0):
         h5 = self._write_h5("d_" + layout, layout)
-        out = os.path.join(self.tmp.name, "out_" + layout, "20260904")
+        out = os.path.join(self.tmp.name, "out_" + layout, "20300105")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         conv.convert(self.xml, h5, out, scale=scale, block_lines=16, quiet=True)
         return out
@@ -551,13 +610,13 @@ class TestConverter(unittest.TestCase):
         self.assertEqual(prm["lookdir"], "L")
         self.assertEqual(prm["orbdir"], "D")
         # 文件名里不能带目录 (GMTSAR 在 PRM 所在目录里按文件名读)
-        self.assertEqual(prm["SLC_file"], "20260904.SLC")
-        self.assertEqual(prm["led_file"], "20260904.LED")
+        self.assertEqual(prm["SLC_file"], "20300105.SLC")
+        self.assertEqual(prm["led_file"], "20300105.LED")
         self.assertAlmostEqual(float(prm["radar_wavelength"]), dm.C_LIGHT / 9.6e9, places=7)
         # clock_start 为年内天数 + 当天秒/86400, 与 SC_clock_start 的小数部分一致
         sc = float(prm["SC_clock_start"])
-        self.assertEqual(int(sc // 1000), 2026)
-        self.assertAlmostEqual(sc - 2026000, float(prm["clock_start"]), places=8)
+        self.assertEqual(int(sc // 1000), 2030)
+        self.assertAlmostEqual(sc - 2030000, float(prm["clock_start"]), places=8)
         # 零多普勒产品: PRM 的 fd1 必须是 0, XML 的多普勒常数项 (-120 Hz) 只记在转换信息里
         self.assertEqual(float(prm["fd1"]), 0.0)
         with open(out + ".convert.txt") as f:
@@ -571,7 +630,7 @@ class TestConverter(unittest.TestCase):
         同时验证这个检验对 fd1 敏感: 若按 XML 的多普勒常数项 (-120 Hz) 写 fd1, 方位坐标会错开上百行。"""
         # 合成场景的目标点在卫星"向下 x 速度"一侧, 即右侧; SAT_llt2rat 的精确模式会按 PRM 的 lookdir 检查侧视方向, 必须一致
         xml = make_xml(os.path.join(self.tmp.name, "gm.XML"), n_az=self.N_AZ, n_rg=self.N_RG, look_side="right")
-        out = os.path.join(self.tmp.name, "gm_out", "20260904")
+        out = os.path.join(self.tmp.name, "gm_out", "20300105")
         os.makedirs(os.path.dirname(out))
         conv.convert(xml, self._write_h5("d_gm", "split"), out, scale=2.0, block_lines=16, quiet=True)
         wd = os.path.dirname(out)
@@ -654,7 +713,7 @@ class TestConverter(unittest.TestCase):
         xml = make_xml(os.path.join(self.tmp.name, "w.XML"), n_az=self.N_AZ, n_rg=self.N_RG, n_vec=41, vec_step=0.025,
                        orbit_fn=_dyn_state, tag_quant=1.7e-4, orbit_level="Real Time orbit")
         h5 = self._write_h5("d_w", "split")
-        out = os.path.join(self.tmp.name, "w_out", "20260904")
+        out = os.path.join(self.tmp.name, "w_out", "20300105")
         os.makedirs(os.path.dirname(out))
         conv.convert(xml, h5, out, scale=2.0, block_lines=16, quiet=True)
         pt0, dsec, nd, t_start, t_end = self._gmtsar_time_axis(out)
