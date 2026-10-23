@@ -66,6 +66,7 @@ COREG_USER_SET=false # 命令行是否给了 --coreg (新版电建一号 XML+HDF
 QA_MODE="on"
 MASK_CORR="0.3"
 MASK_EDGE_NOISE="on"
+DEM_COREG="${DEM_COREG:-off}"  # on=用 DEM 模拟亮度估计并修正雷达坐标 DEM 的整体平移 (dem_coreg.py, 默认关; 平坦场景会自动跳过)
 INPUT_FORMAT="tiff"  # tiff=旧版 XML+TIFF; h5=新版电建一号 XML+HDF5 (discover_data 里按同名 .h5 识别)
 MS_REGISTER_ARGS="${MS_REGISTER_ARGS:-}"  # 额外传给 ms_register.py register 的参数 (高级用法, 如 "--scales 512,256,128")
 GACOS_PATH=""        # GACOS 数据目录 (.ztd + .rsc)
@@ -163,6 +164,7 @@ PowerChina-1 DInSAR 数据处理脚本 v${SCRIPT_VERSION}
   --qa on|off|strict  产品质量检查 (默认 on；strict 时 QA FAIL 会中止流程)
   --mask-corr T      掩膜低相干区域 (默认 0.3；0 表示不按相干性掩膜)
   --mask-edge-noise on|off  掩膜 QA 检测到的边缘残差噪声带 (默认 on)
+  --dem-coreg on|off        DEM 精配准: 估计并修正雷达坐标 DEM 相对影像的整体平移 (默认 off, 也可用环境变量 DEM_COREG)
   --snaphu-conf auto|base|<path>
                                         SNAPHU 配置: auto (默认, 按 PRM 派生) / base (旧配置) / 指定文件
   --snaphu-overlap N                   SNAPHU 分块重叠像元数 (正整数, 默认由处理模式决定)
@@ -287,6 +289,14 @@ parse_args() {
                 case "${2,,}" in
                     on|off) MASK_EDGE_NOISE="${2,,}" ;;
                     *) error_exit "无效 --mask-edge-noise: $2 (on|off)" ;;
+                esac
+                shift 2
+                ;;
+            --dem-coreg)
+                [ "$#" -ge 2 ] || error_exit "--dem-coreg 需要 on 或 off"
+                case "${2,,}" in
+                    on|off) DEM_COREG="${2,,}" ;;
+                    *) error_exit "无效 --dem-coreg: $2 (on|off)" ;;
                 esac
                 shift 2
                 ;;
@@ -1085,6 +1095,8 @@ run_interferogram() {
     local topo_arg=""
     if [ -f "$dem_grd" ]; then
         if [ ! -f dem_ra.grd ]; then
+            # 重新生成 dem_ra.grd 时, 旧的精配准结果作废 (否则会把平移叠加两次)
+            rm -f dem_coreg.json dem_ra_nocoreg.grd dem_ra_coreg.grd trans_coreg.dat
             log_info "生成雷达坐标 DEM (dem_ra.grd) 以去除地形相位..."
             # 整景分辨率的 dem_ra.grd 与 phasediff 的 real/imag 同样大 (新版 SM 整景 1.45 GB), 8~16 GB 内存的机器上
             # 会把内存挤爆。phasediff 允许 topo 网格比 SLC 粗 (SLC 尺寸须是它的整数倍), 新版产品用 4x 粗网格 (auto: 4/2/1 里能整除的最大值)。
@@ -1098,6 +1110,23 @@ run_interferogram() {
             log_info "清洗雷达坐标 DEM (dem_ra.grd) 以免除 NaN 引起的计算链崩溃..."
             gmt grdmath dem_ra.grd 0 AND = dem_ra_clean.grd >> "$LOG_FILE" 2>&1
             mv dem_ra_clean.grd dem_ra.grd
+            # 可选: DEM 精配准 (默认关). 只做整体平移; 平坦/低起伏场景或估计不可靠时自动跳过, 失败不中止流程
+            if [ "$DEM_COREG" = "on" ] && [ ! -f dem_coreg.json ]; then
+                log_info "DEM 精配准: 估计雷达坐标 DEM 相对影像的整体平移 (--dem-coreg on)..."
+                if python3 "$SCRIPT_DIR/dem_coreg.py" estimate --prm "${MASTER_DATE}.PRM" --slc "${MASTER_DATE}.SLC" \
+                        --dem-ra dem_ra.grd --out dem_ra_coreg.grd --report dem_coreg.json >> "$LOG_FILE" 2>&1; then
+                    if [ -s dem_ra_coreg.grd ] && grep -q '"applied": true' dem_coreg.json 2>/dev/null; then
+                        mv dem_ra.grd dem_ra_nocoreg.grd && mv dem_ra_coreg.grd dem_ra.grd
+                        log_info "DEM 精配准已应用 (原 DEM 保留为 dem_ra_nocoreg.grd, 详情见 dem_coreg.json)"
+                    else
+                        rm -f dem_ra_coreg.grd
+                        log_info "DEM 精配准未应用 (估计不可靠或平移可忽略, 原因见 dem_coreg.json)"
+                    fi
+                else
+                    rm -f dem_ra_coreg.grd dem_coreg.json
+                    log_warn "DEM 精配准失败, 按未修正的 DEM 继续 (详见日志)"
+                fi
+            fi
             topo_arg="-topo dem_ra.grd"
             log_info "将去除地形相位 (Differential InSAR 模式)"
         elif [ "$INPUT_FORMAT" = "h5" ]; then
@@ -1847,6 +1876,18 @@ generate_outputs() {
         have_trans=1
     fi
     
+    # 若 DEM 做过精配准, 地理编码用同步平移后的 trans 表, 保证与相位所用的 DEM 一致
+    local trans_file="trans.dat"
+    if [ "$have_trans" -eq 1 ] && [ -f dem_coreg.json ] && grep -q '"applied": true' dem_coreg.json 2>/dev/null; then
+        if python3 "$SCRIPT_DIR/dem_coreg.py" apply-trans --trans trans.dat --report dem_coreg.json --out trans_coreg.dat >> "$LOG_FILE" 2>&1 \
+                && [ -s trans_coreg.dat ]; then
+            trans_file="trans_coreg.dat"
+            log_info "地理编码使用精配准后的 trans 表 (trans_coreg.dat)"
+        else
+            log_warn "生成 trans_coreg.dat 失败, 地理编码退回原 trans.dat (详见日志)"
+        fi
+    fi
+
     if [ "$have_trans" -eq 1 ]; then
         log_info "[Stage 6] 执行地理编码 (RA -> LL)..."
         local proj_csh="$gmtsar_bin/proj_ra2ll.csh"
@@ -1862,21 +1903,21 @@ generate_outputs() {
         local full_dims=""
         [ -n "$full_ncols" ] && [ -n "$full_nrows" ] && full_dims="$full_ncols $full_nrows"
         if [ -f unwrap_detrended.grd ]; then
-            python3 "$py_geocode" trans.dat unwrap_detrended.grd "$results_dir/unwrap_detrended.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
+            python3 "$py_geocode" "$trans_file" unwrap_detrended.grd "$results_dir/unwrap_detrended.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
                 || log_warn "unwrap_detrended 地理编码失败 (详见日志)"
         fi
         local corr_src=""
         [ -f filtcorr.grd ] && corr_src="filtcorr.grd" || corr_src="corr.grd"
         if [ -n "$corr_src" ] && [ -f "$corr_src" ]; then
-            python3 "$py_geocode" trans.dat "$corr_src" "$results_dir/corr.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
+            python3 "$py_geocode" "$trans_file" "$corr_src" "$results_dir/corr.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
                 || log_warn "相干性地理编码失败 (详见日志)"
         fi
         if [ -f los_displacement.grd ]; then
-            python3 "$py_geocode" trans.dat los_displacement.grd "$results_dir/final_data_values.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
+            python3 "$py_geocode" "$trans_file" los_displacement.grd "$results_dir/final_data_values.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
                 || log_warn "LOS 位移地理编码失败 (详见日志)"
         fi
         if [ -f los_displacement_masked.grd ]; then
-            python3 "$py_geocode" trans.dat los_displacement_masked.grd "$results_dir/los_displacement_masked.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
+            python3 "$py_geocode" "$trans_file" los_displacement_masked.grd "$results_dir/los_displacement_masked.tif" 0.0001 $full_dims >> "$LOG_FILE" 2>&1 \
                 || log_warn "掩膜 LOS 位移地理编码失败 (详见日志)"
         fi
         

@@ -23,8 +23,9 @@
 - 判读注意：`corr.tif` 是 `|<I>|/<|I|>`（干涉图的相位相干度），纯噪声区的底约 0.3，不是标准相干系数。去平面后的残差主要是大气，只有一对影像时无法把形变和大气分开。
 - 两景的初始偏移会让干涉图一侧出现一条没有重叠的窄带。这条带里的相位和位移只是噪声，`corr` 也不是 0，请裁掉或忽略。
 - 绝对定位：用 DEM 模拟亮度与 SAR 幅度互相关，可估计 DEM 与影像的整体偏差（主要来自轨道和对流层延迟）。垂直基线较短时这个偏移对干涉相位影响很小，但地理编码结果的绝对位置仍有不确定度。
+- 可选的 DEM 精配准（`--dem-coreg on`，或环境变量 `DEM_COREG=on`；**默认关闭**）：在生成雷达坐标 DEM（`dem_ra.grd`）之后，用 `dem_coreg.py` 对主影像幅度与 DEM 模拟亮度做分块互相关，估计 DEM 相对影像的**整体平移**，通过门限才修正（DEM 起伏足够、相关峰足够强、各块结果一致、平移不超过 15 个网格像元、修正后复核残余变小）；不通过就原样使用 DEM，原因写入 `dem_coreg.json`，不会中断流程。修正时原 DEM 保留为 `dem_ra_nocoreg.grd`，地理编码改用同步平移后的 `trans_coreg.dat`。局限：只做常数平移，不处理随位置变化的偏差；平坦场景会被自动跳过；目前只在条带（SM）单对数据上做过验证；`--qa` 暂未读取该报告。
 
-测试：`python3 -m unittest discover -s tests`（共 90 项，约 6 分钟，大头是配准的合成数据测试）。缺少 h5py、scipy，或 GMTSAR 的 `resamp`、`calc_dop_orb`、`SAT_llt2rat` 时，对应的测试会被跳过；跳过不等于通过，请看输出里的 `skipped`。
+测试：`python3 -m unittest discover -s tests`（共 257 项，约 7 分钟，大头是配准的合成数据测试）。缺少 h5py、scipy，或 GMTSAR 的 `resamp`、`calc_dop_orb`、`SAT_llt2rat` 时，对应的测试会被跳过；跳过不等于通过，请看输出里的 `skipped`。
 
 ## Ray-traced atmospheric correction
 
